@@ -3,7 +3,9 @@ import re
 from collections import defaultdict
 from datetime import date as date_type, datetime
 
+import httpx
 import openpyxl
+from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
@@ -930,6 +932,7 @@ def _tax_excel(
     realized_rows,
     prices: dict,
     deriv_summary: dict | None = None,
+    logo_bytes: bytes | None = None,
 ) -> openpyxl.Workbook:
     """
     Generate a tax filing workbook with sheets:
@@ -1020,6 +1023,18 @@ def _tax_excel(
     ws.column_dimensions["B"].width = 36
     ws.column_dimensions["C"].width = 22
     ws.row_dimensions[1].height = 8
+
+    # Logo (top-left of sheet)
+    if logo_bytes:
+        try:
+            img = XLImage(io.BytesIO(logo_bytes))
+            img.width  = 150
+            img.height = 30
+            img.anchor = "B1"
+            ws.add_image(img)
+            ws.row_dimensions[1].height = 38
+        except Exception:
+            pass
 
     # Title banner
     ws.row_dimensions[2].height = 30
@@ -1401,7 +1416,20 @@ async def download_tax_report(
             ],
         }
 
-    wb = _tax_excel(client_name, holdings, realized_rows, prices, deriv_summary=deriv_summary)
+    # Fetch PROFITMART logo (best-effort — silently ignored on failure)
+    logo_bytes: bytes | None = None
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as hc:
+            logo_resp = await hc.get(
+                "https://profitmart.in/wp-content/uploads/2023/03/Profitmart-Logo.png"
+            )
+            if logo_resp.status_code == 200:
+                logo_bytes = logo_resp.content
+    except Exception:
+        pass
+
+    wb = _tax_excel(client_name, holdings, realized_rows, prices,
+                    deriv_summary=deriv_summary, logo_bytes=logo_bytes)
 
     output = io.BytesIO()
     wb.save(output)
