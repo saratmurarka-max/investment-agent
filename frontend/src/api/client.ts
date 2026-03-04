@@ -92,6 +92,23 @@ export async function deleteHolding(portfolioId: number, holdingId: number) {
   return res.json();
 }
 
+export async function downloadTaxReport(portfolioId: number): Promise<void> {
+  const res = await fetch(`${BASE_URL}/portfolios/${portfolioId}/tax-report`);
+  if (!res.ok) throw new Error("Failed to generate tax report");
+  const blob = await res.blob();
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  // Try to get filename from Content-Disposition header
+  const cd   = res.headers.get("Content-Disposition") ?? "";
+  const match = cd.match(/filename=([^;]+)/);
+  a.download = match ? match[1] : "TaxReport_FY2025-26.xlsx";
+  a.href = url;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 export async function uploadHoldingsExcel(portfolioId: number, file: File) {
   const form = new FormData();
   form.append("file", file);

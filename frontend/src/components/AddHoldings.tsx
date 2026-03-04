@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { type StockResult, addHolding, searchStocks, uploadHoldingsExcel } from "../api/client";
+import { type StockResult, addHolding, downloadTaxReport, searchStocks, uploadHoldingsExcel } from "../api/client";
 
 interface Props {
   portfolioId: number;
@@ -95,6 +95,22 @@ export default function AddHoldings({ portfolioId, onAdded }: Props) {
       setManualError(err instanceof Error ? err.message : "Failed to add holding.");
     } finally {
       setManualLoading(false);
+    }
+  }
+
+  // --- Tax report download ---
+  const [taxLoading, setTaxLoading] = useState(false);
+  const [taxError,   setTaxError]   = useState<string | null>(null);
+
+  async function handleTaxDownload() {
+    setTaxError(null);
+    setTaxLoading(true);
+    try {
+      await downloadTaxReport(portfolioId);
+    } catch (err: unknown) {
+      setTaxError(err instanceof Error ? err.message : "Failed to generate report.");
+    } finally {
+      setTaxLoading(false);
     }
   }
 
@@ -310,6 +326,31 @@ export default function AddHoldings({ portfolioId, onAdded }: Props) {
           )}
         </div>
       )}
+
+      {/* ── Tax Report Download ── */}
+      <div className="mt-5 pt-4 border-t border-gray-100">
+        <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
+          Tax Filing
+        </p>
+        <button
+          onClick={handleTaxDownload}
+          disabled={taxLoading}
+          className="w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 text-white py-2.5 rounded-lg text-sm font-medium transition-colors"
+        >
+          {taxLoading ? (
+            <span className="animate-pulse">Generating report…</span>
+          ) : (
+            <>
+              <span>⬇</span>
+              <span>Download Tax Report  (FY 2025-26)</span>
+            </>
+          )}
+        </button>
+        {taxError && <p className="text-xs text-red-500 mt-1.5">{taxError}</p>}
+        <p className="text-xs text-gray-400 mt-1.5">
+          Excel with STCG / LTCG summary, per-stock realized gains &amp; open positions
+        </p>
+      </div>
     </div>
   );
 }

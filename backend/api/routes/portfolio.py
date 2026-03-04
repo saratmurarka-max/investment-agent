@@ -1,9 +1,13 @@
 import io
 import re
 from collections import defaultdict
+from datetime import date as date_type
 
 import openpyxl
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -498,3 +502,368 @@ async def upload_holdings_excel(
         "skipped": skipped,
         "format_detected": "broker" if broker_fmt else "simple",
     }
+
+
+# ── Tax Report ─────────────────────────────────────────────────────────────────
+
+def _tax_excel(client_name: str, holdings, realized_rows, prices: dict) -> openpyxl.Workbook:
+    """
+    Generate a tax filing workbook with three sheets:
+      1. Tax Summary        – AY, STCG/LTCG totals, estimated tax liability
+      2. Realized Gains     – Per-stock STCG and LTCG breakdown
+      3. Open Positions     – Unrealized P&L on current holdings
+    """
+    wb = openpyxl.Workbook()
+
+    # ── Colour / font helpers ──────────────────────────────────────────────────
+    NAVY   = "1B3A6B"
+    BLUE   = "2E6DB4"
+    LBLUE  = "D9E8F7"
+    GREEN  = "006B3C"
+    RED    = "C00000"
+    GRAY   = "F5F5F5"
+    WHITE  = "FFFFFF"
+    BLACK  = "000000"
+
+    def hdr_font(bold=True, color=WHITE, sz=11):
+        return Font(bold=bold, color=color, size=sz, name="Calibri")
+
+    def cell_font(bold=False, color=BLACK, sz=10):
+        return Font(bold=bold, color=color, size=sz, name="Calibri")
+
+    def fill(hex_color):
+        return PatternFill("solid", fgColor=hex_color)
+
+    def thin_border():
+        s = Side(style="thin", color="C0C0C0")
+        return Border(left=s, right=s, top=s, bottom=s)
+
+    def center(wrap=False):
+        return Alignment(horizontal="center", vertical="center", wrap_text=wrap)
+
+    def right_align():
+        return Alignment(horizontal="right", vertical="center")
+
+    def inr(ws, row, col, value, color=None):
+        cell = ws.cell(row=row, column=col, value=round(float(value), 2))
+        cell.number_format = u'₹#,##0.00'
+        cell.alignment = right_align()
+        cell.border = thin_border()
+        cell.font = cell_font(color=color or BLACK)
+        return cell
+
+    def label(ws, row, col, text, bold=False, bg=None, fg=BLACK, wrap=False, colspan=1):
+        cell = ws.cell(row=row, column=col, value=text)
+        cell.font = cell_font(bold=bold, color=fg, sz=10)
+        cell.alignment = center(wrap) if colspan > 1 else Alignment(vertical="center", wrap_text=wrap)
+        cell.border = thin_border()
+        if bg:
+            cell.fill = fill(bg)
+        if colspan > 1:
+            ws.merge_cells(start_row=row, start_column=col,
+                           end_row=row, end_column=col + colspan - 1)
+        return cell
+
+    FY = "2025-26"
+    AY = "2026-27"
+    today = date_type.today().strftime("%d-%b-%Y")
+
+    # ── Compute totals ─────────────────────────────────────────────────────────
+    total_stcg = sum(float(r.short_term_gain) for r in realized_rows)
+    total_ltcg = sum(float(r.long_term_gain)  for r in realized_rows)
+    ltcg_exempt   = min(max(total_ltcg, 0), 125_000)          # ₹1,25,000 exemption
+    ltcg_taxable  = max(total_ltcg - ltcg_exempt, 0)
+    tax_stcg      = max(total_stcg, 0) * 0.20                 # 20% on STCG
+    tax_ltcg      = ltcg_taxable * 0.125                      # 12.5% on taxable LTCG
+    total_tax_est = tax_stcg + tax_ltcg
+
+    total_invested = sum(float(h.avg_cost) * float(h.shares) for h in holdings)
+    priced = [(h, prices.get(h.ticker, 0.0)) for h in holdings]
+    total_current  = sum(p * float(h.shares) for h, p in priced if p > 0)
+    total_unrealized = sum(
+        (p - float(h.avg_cost)) * float(h.shares)
+        for h, p in priced if p > 0
+    )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SHEET 1 – Tax Summary
+    # ══════════════════════════════════════════════════════════════════════════
+    ws = wb.active
+    ws.title = "Tax Summary"
+    ws.column_dimensions["A"].width = 2
+    ws.column_dimensions["B"].width = 36
+    ws.column_dimensions["C"].width = 22
+    ws.row_dimensions[1].height = 8
+
+    # Title banner
+    ws.row_dimensions[2].height = 30
+    ws.merge_cells("B2:C2")
+    t = ws["B2"]
+    t.value = f"Capital Gains Tax Report — FY {FY}  |  AY {AY}"
+    t.font  = Font(bold=True, color=WHITE, size=14, name="Calibri")
+    t.fill  = fill(NAVY)
+    t.alignment = center()
+    t.border = thin_border()
+
+    # Meta info
+    for r, (lbl, val) in enumerate([
+        ("Client Name",       client_name),
+        ("Assessment Year",   f"AY {AY}"),
+        ("Financial Year",    f"FY {FY}  (01-Apr-2025 to 31-Mar-2026)"),
+        ("Report Generated",  today),
+    ], start=3):
+        ws.row_dimensions[r].height = 18
+        label(ws, r, 2, lbl, bold=True, bg=LBLUE)
+        label(ws, r, 3, val)
+
+    # Spacer
+    ws.row_dimensions[7].height = 10
+
+    # ── Section: Realized Capital Gains ───────────────────────────────────────
+    ws.row_dimensions[8].height = 20
+    ws.merge_cells("B8:C8")
+    sh = ws["B8"]
+    sh.value = "Section A — Realized Capital Gains (Equity)"
+    sh.font, sh.fill, sh.alignment, sh.border = hdr_font(), fill(BLUE), center(), thin_border()
+
+    rows_a = [
+        ("Short-Term Capital Gain / Loss (STCG)",    total_stcg),
+        ("Long-Term Capital Gain / Loss (LTCG)",     total_ltcg),
+        ("LTCG Exemption (up to ₹1,25,000)",        -ltcg_exempt),
+        ("Net Taxable LTCG",                         ltcg_taxable),
+    ]
+    for i, (lbl_text, val) in enumerate(rows_a, start=9):
+        ws.row_dimensions[i].height = 18
+        label(ws, i, 2, lbl_text, bg=GRAY)
+        color = GREEN if val >= 0 else RED
+        inr(ws, i, 3, val, color=color)
+
+    # ── Section: Tax Estimate ─────────────────────────────────────────────────
+    ws.row_dimensions[13].height = 10
+    ws.row_dimensions[14].height = 20
+    ws.merge_cells("B14:C14")
+    sh2 = ws["B14"]
+    sh2.value = "Section B — Estimated Tax Liability"
+    sh2.font, sh2.fill, sh2.alignment, sh2.border = hdr_font(), fill(BLUE), center(), thin_border()
+
+    tax_rows = [
+        ("Tax on STCG @ 20%  (Section 111A)",   tax_stcg),
+        ("Tax on LTCG @ 12.5%  (Section 112A)", tax_ltcg),
+        ("Total Estimated Tax",                  total_tax_est),
+    ]
+    for i, (lbl_text, val) in enumerate(tax_rows, start=15):
+        ws.row_dimensions[i].height = 18
+        bold = (i == 17)
+        label(ws, i, 2, lbl_text, bold=bold, bg=GRAY if not bold else LBLUE)
+        inr(ws, i, 3, val, color=RED if val > 0 else GREEN)
+        if bold:
+            ws.cell(row=i, column=2).font = cell_font(bold=True)
+
+    # ── Section: Open Positions Summary ───────────────────────────────────────
+    ws.row_dimensions[18].height = 10
+    ws.row_dimensions[19].height = 20
+    ws.merge_cells("B19:C19")
+    sh3 = ws["B19"]
+    sh3.value = "Section C — Open Positions (Unrealized)"
+    sh3.font, sh3.fill, sh3.alignment, sh3.border = hdr_font(), fill(BLUE), center(), thin_border()
+
+    open_rows = [
+        ("Total Amount Invested (Open Positions)",   total_invested),
+        ("Current Portfolio Value (Live Prices)",    total_current),
+        ("Unrealized Gain / Loss",                   total_unrealized),
+    ]
+    for i, (lbl_text, val) in enumerate(open_rows, start=20):
+        ws.row_dimensions[i].height = 18
+        label(ws, i, 2, lbl_text, bg=GRAY)
+        inr(ws, i, 3, val, color=GREEN if val >= 0 else RED)
+
+    # Disclaimer
+    ws.row_dimensions[23].height = 10
+    ws.row_dimensions[24].height = 30
+    ws.merge_cells("B24:C24")
+    disc = ws["B24"]
+    disc.value = (
+        "⚠  Disclaimer: Tax rates as per Finance Act 2024 (STCG 20%, LTCG 12.5% with ₹1.25L "
+        "exemption). Figures are computed from broker-uploaded data. Please verify with a "
+        "Chartered Accountant before filing your ITR."
+    )
+    disc.font      = Font(italic=True, color="7F7F7F", size=9, name="Calibri")
+    disc.alignment = Alignment(wrap_text=True, vertical="center")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SHEET 2 – Realized Capital Gains (per stock)
+    # ══════════════════════════════════════════════════════════════════════════
+    ws2 = wb.create_sheet("Realized Capital Gains")
+    COL_WIDTHS2 = [2, 32, 16, 18, 18, 20, 20]
+    for i, w in enumerate(COL_WIDTHS2, 1):
+        ws2.column_dimensions[get_column_letter(i)].width = w
+
+    # Sheet title
+    ws2.row_dimensions[2].height = 26
+    ws2.merge_cells("B2:G2")
+    t2 = ws2["B2"]
+    t2.value = f"Realized Capital Gains — FY {FY}  (Equity)"
+    t2.font, t2.fill, t2.alignment, t2.border = hdr_font(sz=12), fill(NAVY), center(), thin_border()
+
+    # Column headers
+    headers2 = ["#", "Stock Name", "Ticker", "STCG (₹)", "LTCG (₹)", "Tax Est. STCG", "Tax Est. LTCG"]
+    ws2.row_dimensions[3].height = 20
+    for col, hdr in enumerate(headers2, 2):
+        c = ws2.cell(row=3, column=col, value=hdr)
+        c.font, c.fill, c.alignment, c.border = hdr_font(), fill(BLUE), center(True), thin_border()
+
+    row = 4
+    for idx, r in enumerate(realized_rows, 1):
+        stcg = float(r.short_term_gain)
+        ltcg = float(r.long_term_gain)
+        t_stcg = max(stcg, 0) * 0.20
+        t_ltcg = max(ltcg, 0) * 0.125
+        bg = WHITE if idx % 2 == 0 else GRAY
+
+        # Find display name from holdings
+        h_match = next((h for h in holdings if h.ticker == r.ticker), None)
+        dname = (h_match.name or r.ticker) if h_match else r.ticker
+        ticker_display = r.ticker.replace(".NS", "").replace(".BO", "")
+
+        ws2.row_dimensions[row].height = 18
+        for col, val in enumerate([idx, dname, ticker_display, stcg, ltcg, t_stcg, t_ltcg], 2):
+            c = ws2.cell(row=row, column=col, value=val)
+            c.border = thin_border()
+            c.fill   = fill(bg)
+            if col in (5, 6, 7, 8):           # numeric columns
+                c.number_format = u'₹#,##0.00'
+                c.alignment = right_align()
+                c.font = cell_font(color=GREEN if float(val) >= 0 else RED)
+            else:
+                c.font = cell_font()
+        row += 1
+
+    # Totals row
+    ws2.row_dimensions[row].height = 20
+    total_labels = ["", "TOTAL", "", total_stcg, total_ltcg,
+                    max(total_stcg, 0) * 0.20, max(total_ltcg - 125_000, 0) * 0.125]
+    for col, val in enumerate(total_labels, 2):
+        c = ws2.cell(row=row, column=col, value=val)
+        c.font, c.fill, c.border = hdr_font(color=WHITE), fill(NAVY), thin_border()
+        if col >= 5:
+            c.number_format = u'₹#,##0.00'
+            c.alignment = right_align()
+
+    # Tax rate note
+    row += 2
+    ws2.merge_cells(start_row=row, start_column=2, end_row=row, end_column=7)
+    note = ws2.cell(row=row, column=2,
+                    value="Tax Rates: STCG @ 20% (Sec 111A) | LTCG @ 12.5% on gains above ₹1,25,000 (Sec 112A)  |  Finance Act 2024")
+    note.font = Font(italic=True, size=9, color="595959", name="Calibri")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SHEET 3 – Open Positions
+    # ══════════════════════════════════════════════════════════════════════════
+    ws3 = wb.create_sheet("Open Positions")
+    COL_WIDTHS3 = [2, 32, 14, 10, 16, 16, 18, 18, 14]
+    for i, w in enumerate(COL_WIDTHS3, 1):
+        ws3.column_dimensions[get_column_letter(i)].width = w
+
+    ws3.row_dimensions[2].height = 26
+    ws3.merge_cells("B2:J2")
+    t3 = ws3["B2"]
+    t3.value = f"Open Positions as of {today}  |  FY {FY}"
+    t3.font, t3.fill, t3.alignment, t3.border = hdr_font(sz=12), fill(NAVY), center(), thin_border()
+
+    headers3 = ["#", "Stock Name", "Ticker", "Qty", "Avg Cost (₹)", "LTP (₹)",
+                "Invested (₹)", "Current Value (₹)", "Unrealized P&L (₹)", "P&L %"]
+    ws3.row_dimensions[3].height = 20
+    for col, hdr in enumerate(headers3, 2):
+        c = ws3.cell(row=3, column=col, value=hdr)
+        c.font, c.fill, c.alignment, c.border = hdr_font(), fill(BLUE), center(True), thin_border()
+
+    row3 = 4
+    for idx, h in enumerate(holdings, 1):
+        ltp      = prices.get(h.ticker, 0.0)
+        invested = float(h.avg_cost) * float(h.shares)
+        cur_val  = ltp * float(h.shares) if ltp > 0 else None
+        unreal   = (cur_val - invested) if cur_val is not None else None
+        pct      = ((ltp - float(h.avg_cost)) / float(h.avg_cost) * 100) if ltp > 0 and float(h.avg_cost) > 0 else None
+        bg       = WHITE if idx % 2 == 0 else GRAY
+        name_disp   = h.name or h.ticker
+        ticker_disp = h.ticker.replace(".NS", "").replace(".BO", "")
+
+        ws3.row_dimensions[row3].height = 18
+        vals = [idx, name_disp, ticker_disp, float(h.shares), float(h.avg_cost),
+                ltp if ltp > 0 else "—", invested, cur_val or "—", unreal or "—",
+                f"{pct:+.2f}%" if pct is not None else "—"]
+        num_cols = {5, 6, 7, 8, 9}
+        for col, val in enumerate(vals, 2):
+            c = ws3.cell(row=row3, column=col, value=val)
+            c.border = thin_border()
+            c.fill   = fill(bg)
+            if col in num_cols and isinstance(val, (int, float)):
+                c.number_format = u'₹#,##0.00'
+                c.alignment = right_align()
+                if col in (9, 10) and isinstance(val, float):
+                    c.font = cell_font(color=GREEN if val >= 0 else RED)
+                else:
+                    c.font = cell_font()
+            elif col == 4:
+                c.alignment = right_align()
+                c.font = cell_font()
+            else:
+                c.font = cell_font()
+        row3 += 1
+
+    # Total row
+    ws3.row_dimensions[row3].height = 20
+    tot_vals = ["", "TOTAL", "", "", "", "", total_invested, total_current or "—",
+                total_unrealized or "—", ""]
+    for col, val in enumerate(tot_vals, 2):
+        c = ws3.cell(row=row3, column=col, value=val)
+        c.font, c.fill, c.border = hdr_font(color=WHITE), fill(NAVY), thin_border()
+        if col in (8, 9, 10) and isinstance(val, (int, float)):
+            c.number_format = u'₹#,##0.00'
+            c.alignment = right_align()
+
+    return wb
+
+
+@router.get("/{portfolio_id}/tax-report")
+async def download_tax_report(
+    portfolio_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate and download a Tax P&L report in Excel format for the current FY."""
+    portfolio = await db.get(Portfolio, portfolio_id)
+    if not portfolio:
+        raise HTTPException(404, "Portfolio not found")
+
+    client = await db.get(Client, portfolio.client_id)
+    client_name = client.name if client else "Client"
+
+    # Holdings
+    h_res = await db.execute(select(Holding).where(Holding.portfolio_id == portfolio_id))
+    holdings = h_res.scalars().all()
+
+    # Realized P&L rows
+    pnl_res = await db.execute(select(RealizedPnL).where(RealizedPnL.portfolio_id == portfolio_id))
+    realized_rows = pnl_res.scalars().all()
+
+    # Live prices for open positions
+    tickers = [h.ticker for h in holdings]
+    names   = {h.ticker: h.name for h in holdings if h.name}
+    try:
+        prices = await market_data.get_current_prices(tickers, names=names)
+    except Exception:
+        prices = {}
+
+    wb = _tax_excel(client_name, holdings, realized_rows, prices)
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    safe_name = re.sub(r"[^\w\-]", "_", portfolio.name)
+    filename  = f"TaxReport_FY2025-26_{safe_name}.xlsx"
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
