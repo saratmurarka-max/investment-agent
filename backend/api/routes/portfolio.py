@@ -42,12 +42,21 @@ def _normalise_headers(row) -> list[str]:
     return [str(h).lower().strip().replace(" ", "_").replace("\\", "") if h else "" for h in row]
 
 
-def _to_nse_ticker(symbol: str) -> str:
+def _to_exchange_ticker(symbol: str) -> str:
+    """
+    Resolve a raw broker symbol to a yfinance-compatible ticker.
+    Defaults to .NS (NSE) — the primary exchange for most Indian stocks.
+    Symbols already carrying .NS / .BO are returned unchanged.
+    Numeric BSE codes (e.g. 500285-EQ) are left as-is.
+    """
     symbol = symbol.strip().upper()
+    # Already qualified
     if symbol.endswith(".NS") or symbol.endswith(".BO"):
         return symbol
+    # Numeric BSE code — leave as-is (yfinance won't know it, but we keep the data)
     if re.match(r"^\d+(-EQ)?$", symbol):
         return symbol
+    # Default to NSE (primary Indian exchange)
     return symbol + ".NS"
 
 
@@ -121,7 +130,7 @@ def _parse_broker_format(rows: list) -> tuple[list[dict], list[dict], list[str]]
 
     holdings = [
         {
-            "ticker":   _to_nse_ticker(sym),
+            "ticker":   _to_exchange_ticker(sym),
             "shares":   round(data["net_qty"], 6),
             "avg_cost": round(data["cost_basis"] / data["net_qty"], 4),
         }
@@ -131,7 +140,7 @@ def _parse_broker_format(rows: list) -> tuple[list[dict], list[dict], list[str]]
 
     realized_pnls = [
         {
-            "ticker":           _to_nse_ticker(sym),
+            "ticker":           _to_exchange_ticker(sym),
             "short_term_gain":  round(data["short_term"], 4),
             "long_term_gain":   round(data["long_term"], 4),
         }
