@@ -7,11 +7,11 @@ interface Holding {
   name?: string;
   shares: number;
   avg_cost: number;
-  current_price?: number;
+  current_price?: number | null;
   invested?: number;
-  current_value?: number;
-  unrealized_gain?: number;
-  unrealized_pct?: number;
+  current_value?: number | null;
+  unrealized_gain?: number | null;
+  unrealized_pct?: number | null;
 }
 
 interface Summary {
@@ -48,12 +48,12 @@ function displayTicker(ticker: string) {
   return ticker.replace(/\.(NS|BO)$/i, "");
 }
 
-function PnLBadge({ value, pct }: { value: number; pct?: number }) {
+function PnLBadge({ value, pct }: { value: number; pct?: number | null }) {
   const pos = value >= 0;
   return (
     <span className={`font-medium ${pos ? "text-green-600" : "text-red-500"}`}>
       {pos ? "+" : ""}{fmt(value)}
-      {pct !== undefined && (
+      {pct != null && (
         <span className="text-xs ml-1 opacity-80">
           ({pos ? "+" : ""}{pct.toFixed(2)}%)
         </span>
@@ -62,12 +62,21 @@ function PnLBadge({ value, pct }: { value: number; pct?: number }) {
   );
 }
 
-function SummaryCard({ label, value, sub }: { label: string; value: string; sub?: string }) {
+function SummaryCard({ label, value, sub, subColor }: {
+  label: string;
+  value: string;
+  sub?: string;
+  subColor?: "red" | "green" | "gray";
+}) {
+  const colorClass =
+    subColor === "green" ? "text-green-600" :
+    subColor === "red"   ? "text-red-500"   :
+    "text-gray-400";
   return (
     <div className="bg-gray-50 rounded-lg p-3 text-center">
       <p className="text-xs text-gray-400 mb-1">{label}</p>
       <p className="text-sm font-semibold text-gray-800">{value}</p>
-      {sub && <p className="text-xs text-gray-400 mt-0.5">{sub}</p>}
+      {sub && <p className={`text-xs mt-0.5 ${colorClass}`}>{sub}</p>}
     </div>
   );
 }
@@ -95,7 +104,6 @@ export default function Portfolio({ portfolioId, refreshKey }: Props) {
       .then((d) => {
         setData(d);
         setError(null);
-        // Auto-load P&L after holdings are loaded
         loadPnL(d.holdings);
       })
       .catch(() => {
@@ -113,7 +121,6 @@ export default function Portfolio({ portfolioId, refreshKey }: Props) {
     setPnlLoading(true);
     getPortfolioPnL(portfolioId)
       .then((pnlData) => {
-        // Merge P&L data into holdings by id
         const pnlMap = new Map(pnlData.holdings.map((h: Holding) => [h.id, h]));
         setData((prev) =>
           prev
@@ -145,7 +152,8 @@ export default function Portfolio({ portfolioId, refreshKey }: Props) {
   }
 
   async function handleDelete(holding: Holding) {
-    if (!confirm(`Delete ${holding.ticker} from portfolio?`)) return;
+    const label = holding.name || displayTicker(holding.ticker);
+    if (!confirm(`Delete ${label} from portfolio?`)) return;
     setDeletingId(holding.id);
     try {
       await deleteHolding(portfolioId, holding.id);
@@ -182,7 +190,14 @@ export default function Portfolio({ portfolioId, refreshKey }: Props) {
     );
   }
 
-  const hasLivePrices = data.holdings.some((h) => h.current_price !== undefined && h.current_price! > 0);
+  const hasLivePrices = data.holdings.some((h) => h.current_price != null && h.current_price > 0);
+  const missingLtp    = data.holdings.filter((h) => h.current_price == null || h.current_price === 0).length;
+  const pricedCount   = data.holdings.length - missingLtp;
+
+  const unrealizedGain   = summary?.total_unrealized_gain ?? 0;
+  const unrealizedPct    = summary?.total_unrealized_pct  ?? 0;
+  const unrealizedColor  = unrealizedGain >= 0 ? "green" : "red";
+  const unrealizedSub    = `${unrealizedGain >= 0 ? "+" : ""}${fmt(unrealizedGain)} (${unrealizedPct >= 0 ? "+" : ""}${unrealizedPct.toFixed(2)}%)${missingLtp > 0 && pricedCount > 0 ? `*` : ""}`;
 
   return (
     <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5 space-y-4">
@@ -200,28 +215,41 @@ export default function Portfolio({ portfolioId, refreshKey }: Props) {
 
       {/* P&L Summary Cards */}
       {summary && (
-        <div className="grid grid-cols-2 gap-2">
-          <SummaryCard label="Total Invested" value={fmt(summary.total_invested)} />
-          <SummaryCard
-            label="Current Value"
-            value={fmt(summary.total_current_value)}
-            sub={summary.total_unrealized_gain >= 0
-              ? `+${fmt(summary.total_unrealized_gain)} (${summary.total_unrealized_pct.toFixed(2)}%)`
-              : `${fmt(summary.total_unrealized_gain)} (${summary.total_unrealized_pct.toFixed(2)}%)`}
-          />
-          {summary.total_realized_gain !== 0 && (
-            <>
-              <SummaryCard
-                label="Realized Gain (STCG)"
-                value={fmt(summary.total_short_term_gain)}
-              />
-              <SummaryCard
-                label="Realized Gain (LTCG)"
-                value={fmt(summary.total_long_term_gain)}
-              />
-            </>
+        <>
+          <div className="grid grid-cols-2 gap-2">
+            <SummaryCard
+              label="Total Invested"
+              value={fmt(summary.total_invested)}
+              sub={`${data.holdings.length} holdings`}
+              subColor="gray"
+            />
+            <SummaryCard
+              label="Current Value"
+              value={fmt(summary.total_current_value)}
+              sub={unrealizedSub}
+              subColor={unrealizedColor}
+            />
+            {summary.total_realized_gain !== 0 && (
+              <>
+                <SummaryCard
+                  label="Realized Gain (STCG)"
+                  value={fmt(summary.total_short_term_gain)}
+                  subColor={summary.total_short_term_gain >= 0 ? "green" : "red"}
+                />
+                <SummaryCard
+                  label="Realized Gain (LTCG)"
+                  value={fmt(summary.total_long_term_gain)}
+                  subColor={summary.total_long_term_gain >= 0 ? "green" : "red"}
+                />
+              </>
+            )}
+          </div>
+          {missingLtp > 0 && pricedCount > 0 && (
+            <p className="text-xs text-amber-500">
+              * {missingLtp} holding{missingLtp > 1 ? "s" : ""} without live price counted at cost (break-even). Current Value % reflects only priced holdings.
+            </p>
           )}
-        </div>
+        </>
       )}
 
       {/* Holdings Table */}
@@ -229,59 +257,77 @@ export default function Portfolio({ portfolioId, refreshKey }: Props) {
         <table className="w-full text-sm">
           <thead>
             <tr className="text-left text-gray-400 border-b border-gray-100 text-xs">
-              <th className="pb-2 font-medium">Ticker</th>
-              <th className="pb-2 font-medium text-right">Shares</th>
-              <th className="pb-2 font-medium text-right">Avg Buy</th>
+              <th className="pb-2 font-medium">Stock</th>
+              <th className="pb-2 font-medium text-right">Qty</th>
+              <th className="pb-2 font-medium text-right">Avg Cost</th>
               {hasLivePrices && (
                 <>
                   <th className="pb-2 font-medium text-right">LTP</th>
                   <th className="pb-2 font-medium text-right">Value</th>
-                  <th className="pb-2 font-medium text-right">Unrealized P&L</th>
+                  <th className="pb-2 font-medium text-right">Unrealized P&amp;L</th>
                 </>
               )}
               <th className="pb-2 font-medium text-right">Action</th>
             </tr>
           </thead>
           <tbody>
-            {data.holdings.map((h) => (
-              <tr key={h.id} className="border-b border-gray-50 hover:bg-gray-50">
-                <td className="py-2 font-medium text-blue-700 text-xs">
-                  {h.name ? (
-                    <span title={displayTicker(h.ticker)}>{h.name}</span>
-                  ) : (
-                    <span className="font-mono">{displayTicker(h.ticker)}</span>
+            {data.holdings.map((h) => {
+              const hasPrice = h.current_price != null && h.current_price > 0;
+              return (
+                <tr key={h.id} className="border-b border-gray-50 hover:bg-gray-50">
+                  {/* Stock name */}
+                  <td className="py-2 font-medium text-blue-700 text-xs">
+                    {h.name ? (
+                      <span title={displayTicker(h.ticker)}>{h.name}</span>
+                    ) : (
+                      <span className="font-mono">{displayTicker(h.ticker)}</span>
+                    )}
+                  </td>
+
+                  {/* Qty */}
+                  <td className="py-2 text-right text-gray-600 text-xs">{h.shares.toFixed(0)}</td>
+
+                  {/* Avg Cost */}
+                  <td className="py-2 text-right text-gray-600 text-xs">{fmt(h.avg_cost)}</td>
+
+                  {hasLivePrices && (
+                    <>
+                      {/* LTP */}
+                      <td className="py-2 text-right text-gray-600 text-xs">
+                        {hasPrice
+                          ? fmt(h.current_price!)
+                          : <span className="text-gray-300">—</span>}
+                      </td>
+
+                      {/* Value = qty × LTP */}
+                      <td className="py-2 text-right text-gray-600 text-xs">
+                        {hasPrice && h.current_value != null
+                          ? fmt(h.current_value)
+                          : <span className="text-gray-300">—</span>}
+                      </td>
+
+                      {/* Unrealized P&L */}
+                      <td className="py-2 text-right text-xs">
+                        {hasPrice && h.unrealized_gain != null
+                          ? <PnLBadge value={h.unrealized_gain} pct={h.unrealized_pct} />
+                          : <span className="text-gray-300">—</span>}
+                      </td>
+                    </>
                   )}
-                </td>
-                <td className="py-2 text-right text-gray-600 text-xs">{h.shares.toFixed(2)}</td>
-                <td className="py-2 text-right text-gray-600 text-xs">{fmt(h.avg_cost)}</td>
-                {hasLivePrices && (
-                  <>
-                    <td className="py-2 text-right text-gray-600 text-xs">
-                      {h.current_price ? fmt(h.current_price) : <span className="text-gray-300">—</span>}
-                    </td>
-                    <td className="py-2 text-right text-gray-600 text-xs">
-                      {h.current_value ? fmt(h.current_value) : <span className="text-gray-300">—</span>}
-                    </td>
-                    <td className="py-2 text-right text-xs">
-                      {h.unrealized_gain !== undefined ? (
-                        <PnLBadge value={h.unrealized_gain} pct={h.unrealized_pct} />
-                      ) : (
-                        <span className="text-gray-300">—</span>
-                      )}
-                    </td>
-                  </>
-                )}
-                <td className="py-2 text-right">
-                  <button
-                    onClick={() => handleDelete(h)}
-                    disabled={deletingId === h.id}
-                    className="text-red-400 hover:text-red-600 disabled:opacity-40 text-xs px-2 py-1 rounded hover:bg-red-50"
-                  >
-                    {deletingId === h.id ? "..." : "Delete"}
-                  </button>
-                </td>
-              </tr>
-            ))}
+
+                  {/* Delete */}
+                  <td className="py-2 text-right">
+                    <button
+                      onClick={() => handleDelete(h)}
+                      disabled={deletingId === h.id}
+                      className="text-red-400 hover:text-red-600 disabled:opacity-40 text-xs px-2 py-1 rounded hover:bg-red-50"
+                    >
+                      {deletingId === h.id ? "..." : "Delete"}
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
         {data.holdings.length === 0 && (

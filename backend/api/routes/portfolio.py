@@ -282,10 +282,20 @@ async def get_portfolio_pnl(portfolio_id: int, db: AsyncSession = Depends(get_db
         shares   = float(h.shares)
         price    = current_prices.get(h.ticker, 0.0)
 
-        invested      = avg_cost * shares
-        current_value = price * shares
-        unrealized    = current_value - invested
-        pct           = ((price - avg_cost) / avg_cost * 100) if avg_cost > 0 and price > 0 else 0.0
+        invested = avg_cost * shares
+        total_invested += invested
+
+        if price > 0:
+            current_value  = price * shares
+            unrealized     = current_value - invested
+            pct            = (price - avg_cost) / avg_cost * 100 if avg_cost > 0 else 0.0
+            total_current_value += current_value
+        else:
+            # LTP unavailable — assume break-even for portfolio summary totals
+            current_value  = None
+            unrealized     = None
+            pct            = None
+            total_current_value += invested  # treat as break-even so summary % isn't distorted
 
         holding_pnl.append({
             "id":              h.id,
@@ -293,15 +303,12 @@ async def get_portfolio_pnl(portfolio_id: int, db: AsyncSession = Depends(get_db
             "name":            h.name,
             "shares":          shares,
             "avg_cost":        avg_cost,
-            "current_price":   price,
+            "current_price":   price if price > 0 else None,
             "invested":        round(invested, 2),
-            "current_value":   round(current_value, 2),
-            "unrealized_gain": round(unrealized, 2),
-            "unrealized_pct":  round(pct, 2),
+            "current_value":   round(current_value, 2) if current_value is not None else None,
+            "unrealized_gain": round(unrealized, 2) if unrealized is not None else None,
+            "unrealized_pct":  round(pct, 2) if pct is not None else None,
         })
-
-        total_invested      += invested
-        total_current_value += current_value
 
     # Fetch realized P&L stored from broker uploads
     real_result = await db.execute(
