@@ -31,6 +31,7 @@ class Portfolio(Base):
 
     client: Mapped["Client"] = relationship(back_populates="portfolios")
     holdings: Mapped[list["Holding"]] = relationship(back_populates="portfolio", cascade="all, delete-orphan")
+    realized_pnls: Mapped[list["RealizedPnL"]] = relationship(back_populates="portfolio", cascade="all, delete-orphan")
 
 
 class Holding(Base):
@@ -44,3 +45,16 @@ class Holding(Base):
     purchased_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     portfolio: Mapped["Portfolio"] = relationship(back_populates="holdings")
+
+
+class RealizedPnL(Base):
+    """Stores realized gains/losses from sold positions (populated from broker uploads)."""
+    __tablename__ = "realized_pnl"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    portfolio_id: Mapped[int] = mapped_column(ForeignKey("portfolios.id"), index=True)
+    ticker: Mapped[str] = mapped_column(String(20))
+    short_term_gain: Mapped[Decimal] = mapped_column(Numeric(18, 4))  # STCG
+    long_term_gain: Mapped[Decimal] = mapped_column(Numeric(18, 4))   # LTCG
+
+    portfolio: Mapped["Portfolio"] = relationship(back_populates="realized_pnls")

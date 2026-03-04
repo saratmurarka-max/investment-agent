@@ -74,6 +74,12 @@ export async function addHolding(
   return res.json();
 }
 
+export async function getPortfolioPnL(portfolioId: number) {
+  const res = await fetch(`${BASE_URL}/portfolios/${portfolioId}/pnl`);
+  if (!res.ok) throw new Error("Failed to load P&L data");
+  return res.json();
+}
+
 export async function deleteHolding(portfolioId: number, holdingId: number) {
   const res = await fetch(
     `${BASE_URL}/portfolios/${portfolioId}/holdings/${holdingId}`,
