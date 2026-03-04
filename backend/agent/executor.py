@@ -1,5 +1,6 @@
 """Resolves tool calls from the agent into real function results."""
 
+import asyncio
 import json
 from typing import Any
 
@@ -9,6 +10,8 @@ from sqlalchemy.orm import selectinload
 
 from backend.db.models import Holding, Portfolio
 from backend.services import market_data, portfolio_analysis
+
+TOOL_TIMEOUT_SECONDS = 25
 
 
 async def _load_holdings(portfolio_id: int, db: AsyncSession) -> list[dict]:
@@ -28,7 +31,17 @@ async def _load_holdings(portfolio_id: int, db: AsyncSession) -> list[dict]:
 
 async def execute_tool(name: str, inputs: dict[str, Any], db: AsyncSession) -> str:
     try:
-        result = await _dispatch(name, inputs, db)
+        result = await asyncio.wait_for(
+            _dispatch(name, inputs, db),
+            timeout=TOOL_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        result = {
+            "error": (
+                f"'{name}' timed out after {TOOL_TIMEOUT_SECONDS}s. "
+                "Market data fetch is slow — please try a simpler question or try again shortly."
+            )
+        }
     except Exception as e:
         result = {"error": str(e)}
     return json.dumps(result, default=str)

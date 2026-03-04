@@ -27,8 +27,11 @@ Guidelines:
 - Always remind clients that this is informational analysis, not personalized
   investment advice, and that they should consult a licensed financial advisor
   for major decisions.
+- If a tool returns an error, acknowledge it and work with what you have.
 - If a question is outside your data (e.g., tax advice, legal matters), say so clearly.
 """
+
+MAX_TOOL_ROUNDS = 6
 
 
 async def run_agent(
@@ -42,6 +45,7 @@ async def run_agent(
     """
     client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
     conversation = list(messages)
+    tool_rounds = 0
 
     try:
         while True:
@@ -60,6 +64,27 @@ async def run_agent(
                 break
 
             if response.stop_reason == "tool_use":
+                tool_rounds += 1
+
+                # Safety cap: if too many tool rounds, force a final answer
+                if tool_rounds > MAX_TOOL_ROUNDS:
+                    yield "\n\n*Summarising with available data...*\n\n"
+                    conversation.append({"role": "assistant", "content": response.content})
+                    conversation.append({
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Please summarise what you have found and give your analysis now."}],
+                    })
+                    final = await client.messages.create(
+                        model="claude-sonnet-4-6",
+                        max_tokens=2048,
+                        system=SYSTEM_PROMPT,
+                        messages=conversation,
+                    )
+                    for block in final.content:
+                        if hasattr(block, "text"):
+                            yield block.text
+                    break
+
                 conversation.append({"role": "assistant", "content": response.content})
 
                 tool_results = []
