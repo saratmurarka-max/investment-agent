@@ -64,7 +64,7 @@ def _is_broker_format(rows: list) -> bool:
     if len(rows) < 4:
         return False
     headers = _normalise_headers(rows[3])
-    return "scrip_symbol" in headers and "purchase_qty" in headers
+    return "scrip_name" in headers and "purchase_qty" in headers
 
 
 def _parse_broker_format(rows: list) -> tuple[list[dict], list[dict], list[str]]:
@@ -85,7 +85,7 @@ def _parse_broker_format(rows: list) -> tuple[list[dict], list[dict], list[str]]
                 return headers.index(n)
         return -1
 
-    sym_idx       = col(["scrip_symbol"])
+    sym_idx       = col(["scrip_name"])           # NSE ticker name (e.g. RELIANCE, TCS)
     qty_idx       = col(["purchase_qty"])
     rate_idx      = col(["purchase_rate"])
     sell_qty_idx  = col(["sell_qty"])
