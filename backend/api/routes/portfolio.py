@@ -1,4 +1,6 @@
 import io
+import re
+from collections import defaultdict
 
 import openpyxl
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
@@ -31,6 +33,99 @@ class ClientIn(BaseModel):
     name: str
     email: str
     risk_tolerance: str = "medium"
+
+
+# --- Helpers ---
+
+def _normalise_headers(row) -> list[str]:
+    return [str(h).lower().strip().replace(" ", "_") if h else "" for h in row]
+
+
+def _to_nse_ticker(symbol: str) -> str:
+    """Convert a raw broker symbol to an NSE ticker (e.g. RELIANCE → RELIANCE.NS)."""
+    symbol = symbol.strip().upper()
+    # Already has exchange suffix
+    if symbol.endswith(".NS") or symbol.endswith(".BO"):
+        return symbol
+    # BSE numeric code like 500285-EQ — keep as-is, yfinance won't know it anyway
+    if re.match(r"^\d+(-EQ)?$", symbol):
+        return symbol
+    return symbol + ".NS"
+
+
+def _parse_broker_format(rows: list) -> tuple[list[dict], list[str]]:
+    """
+    Parse PROFITMART / broker portfolio report format.
+    Rows 1-3: metadata; Row 4 (index 3): headers; Rows 5+ (index 4+): data.
+
+    Extracts open / partially-open positions and aggregates by symbol.
+    Returns (holdings_list, skipped_list).
+    """
+    if len(rows) < 5:
+        return [], []
+
+    headers = _normalise_headers(rows[3])  # row 4 = index 3
+
+    def col(names: list[str]) -> int:
+        for n in names:
+            if n in headers:
+                return headers.index(n)
+        return -1
+
+    sym_idx      = col(["scrip_symbol"])
+    qty_idx      = col(["purchase_qty"])
+    rate_idx     = col(["purchase_rate"])
+    sell_qty_idx = col(["sell_qty"])
+    sell_date_idx = col(["sell_trade_date"])
+
+    if any(i == -1 for i in [sym_idx, qty_idx, rate_idx]):
+        return [], ["Could not find required broker columns (Scrip_Symbol, Purchase_Qty, Purchase_Rate)"]
+
+    # Aggregate net open positions by symbol
+    agg: dict[str, dict] = defaultdict(lambda: {"net_qty": 0.0, "cost_basis": 0.0})
+    skipped: list[str] = []
+
+    for i, row in enumerate(rows[4:], start=5):
+        try:
+            symbol = str(row[sym_idx] or "").strip().upper()
+            if not symbol or symbol == "NONE":
+                continue
+
+            buy_qty  = float(row[qty_idx]  or 0)
+            buy_rate = float(row[rate_idx] or 0)
+            sell_qty = float(row[sell_qty_idx] or 0) if sell_qty_idx >= 0 else 0
+
+            if buy_qty <= 0:
+                continue
+
+            net_qty = buy_qty - sell_qty
+            if net_qty <= 0:
+                continue  # fully sold, skip
+
+            agg[symbol]["net_qty"]    += net_qty
+            agg[symbol]["cost_basis"] += net_qty * buy_rate
+
+        except Exception:
+            skipped.append(f"row {i}")
+
+    holdings = []
+    for symbol, data in agg.items():
+        if data["net_qty"] > 0:
+            holdings.append({
+                "ticker":   _to_nse_ticker(symbol),
+                "shares":   round(data["net_qty"], 6),
+                "avg_cost": round(data["cost_basis"] / data["net_qty"], 4),
+            })
+
+    return holdings, skipped
+
+
+def _is_broker_format(rows: list) -> bool:
+    """Detect broker format by looking for Scrip_Symbol in row 4 (index 3)."""
+    if len(rows) < 4:
+        return False
+    headers = _normalise_headers(rows[3])
+    return "scrip_symbol" in headers and "purchase_qty" in headers
 
 
 # --- Routes ---
@@ -154,12 +249,16 @@ async def upload_holdings_excel(
     """
     Upload an Excel file (.xlsx) to bulk-add holdings.
 
-    Expected columns (case-insensitive, in any order):
-        ticker | shares | avg_cost  (or average_cost / avg cost / cost)
-    Row 1 must be headers. Example:
-        Ticker  | Shares | Avg Cost
-        AAPL    | 10     | 150.00
-        MSFT    | 5      | 280.00
+    Supports two formats:
+
+    1. BROKER FORMAT (PROFITMART / similar):
+       - Rows 1-3: metadata (broker name, report title, date)
+       - Row 4: headers including Scrip_Symbol, Purchase_Qty, Purchase_Rate, Sell_Qty
+       - Automatically extracts open positions, aggregates by symbol, adds .NS suffix
+
+    2. SIMPLE FORMAT:
+       - Row 1: headers — Ticker | Shares | Avg Cost
+       - Row 2+: data rows
     """
     if not file.filename or not file.filename.endswith(".xlsx"):
         raise HTTPException(400, "Only .xlsx files are supported")
@@ -179,46 +278,64 @@ async def upload_holdings_excel(
     if len(rows) < 2:
         raise HTTPException(400, "File must have a header row and at least one data row.")
 
-    # Normalise header names
-    headers = [str(h).lower().strip().replace(" ", "_") if h else "" for h in rows[0]]
+    # --- Detect and parse format ---
+    if _is_broker_format(rows):
+        holdings_to_add, skipped = _parse_broker_format(rows)
+    else:
+        # Simple format
+        headers = _normalise_headers(rows[0])
 
-    def find_col(candidates: list[str]) -> int:
-        for c in candidates:
-            if c in headers:
-                return headers.index(c)
-        return -1
+        def find_col(candidates: list[str]) -> int:
+            for c in candidates:
+                if c in headers:
+                    return headers.index(c)
+            return -1
 
-    ticker_idx = find_col(["ticker", "symbol", "stock"])
-    shares_idx = find_col(["shares", "quantity", "qty", "units"])
-    cost_idx   = find_col(["avg_cost", "average_cost", "avg_cost_per_share", "cost", "price", "buy_price"])
+        ticker_idx = find_col(["ticker", "symbol", "stock", "scrip_symbol"])
+        shares_idx = find_col(["shares", "quantity", "qty", "units", "purchase_qty"])
+        cost_idx   = find_col(["avg_cost", "average_cost", "avg_cost_per_share",
+                                "cost", "price", "buy_price", "purchase_rate"])
 
-    missing = []
-    if ticker_idx == -1: missing.append("ticker")
-    if shares_idx == -1: missing.append("shares")
-    if cost_idx   == -1: missing.append("avg_cost")
-    if missing:
-        raise HTTPException(
-            400,
-            f"Could not find required columns: {', '.join(missing)}. "
-            f"Headers found: {', '.join(headers)}"
-        )
+        missing = []
+        if ticker_idx == -1: missing.append("ticker/symbol")
+        if shares_idx == -1: missing.append("shares/qty")
+        if cost_idx   == -1: missing.append("avg_cost/price")
+        if missing:
+            raise HTTPException(
+                400,
+                f"Could not find required columns: {', '.join(missing)}. "
+                f"Headers found: {', '.join(h for h in headers if h)}"
+            )
 
-    added, skipped = [], []
-    for i, row in enumerate(rows[1:], start=2):
-        try:
-            ticker = str(row[ticker_idx]).upper().strip()
-            shares = float(row[shares_idx])
-            avg_cost = float(row[cost_idx])
-            if not ticker or shares <= 0 or avg_cost <= 0:
-                raise ValueError("Invalid values")
-            db.add(Holding(portfolio_id=portfolio_id, ticker=ticker, shares=shares, avg_cost=avg_cost))
-            added.append(ticker)
-        except Exception:
-            skipped.append(f"row {i}")
+        holdings_to_add, skipped = [], []
+        for i, row in enumerate(rows[1:], start=2):
+            try:
+                ticker   = str(row[ticker_idx]).upper().strip()
+                shares   = float(row[shares_idx])
+                avg_cost = float(row[cost_idx])
+                if not ticker or shares <= 0 or avg_cost <= 0:
+                    raise ValueError("Invalid values")
+                holdings_to_add.append({"ticker": ticker, "shares": shares, "avg_cost": avg_cost})
+            except Exception:
+                skipped.append(f"row {i}")
+
+    if not holdings_to_add:
+        raise HTTPException(400, "No valid open positions found in the file.")
+
+    added = []
+    for h in holdings_to_add:
+        db.add(Holding(
+            portfolio_id=portfolio_id,
+            ticker=h["ticker"],
+            shares=h["shares"],
+            avg_cost=h["avg_cost"],
+        ))
+        added.append(h["ticker"])
 
     await db.commit()
     return {
         "added": len(added),
         "tickers": added,
         "skipped": skipped,
+        "format_detected": "broker" if _is_broker_format(rows) else "simple",
     }
