@@ -13,33 +13,47 @@ from backend.db.models import Client, Portfolio
 from backend.services.nse import get_nse_stocks
 
 
+async def _init_db() -> None:
+    """
+    Non-blocking DB initialisation — runs as a background task so the
+    HTTP server starts accepting connections immediately (fixes Render
+    port-scan timeout when Neon has a cold-start delay).
+    """
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(Client).where(Client.id == 1))
+            if not result.scalar_one_or_none():
+                client = Client(
+                    name="Demo Client",
+                    email="demo@example.com",
+                    risk_tolerance="medium",
+                )
+                session.add(client)
+                await session.flush()
+                portfolio = Portfolio(
+                    client_id=client.id,
+                    name="My Portfolio",
+                    currency="INR",
+                )
+                session.add(portfolio)
+                await session.commit()
+
+        # Pre-warm the NSE stock cache after DB is ready
+        asyncio.create_task(get_nse_stocks())
+
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create tables on startup
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    # Seed a default client + portfolio (ID=1) if they don't exist yet
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(Client).where(Client.id == 1))
-        if not result.scalar_one_or_none():
-            client = Client(
-                name="Demo Client",
-                email="demo@example.com",
-                risk_tolerance="medium",
-            )
-            session.add(client)
-            await session.flush()
-            portfolio = Portfolio(
-                client_id=client.id,
-                name="My Portfolio",
-                currency="INR",
-            )
-            session.add(portfolio)
-            await session.commit()
-
-    # Pre-warm the NSE stock cache in the background
-    asyncio.create_task(get_nse_stocks())
+    # Kick off DB setup in the background — returns instantly so the
+    # port is bound and health-checks succeed before Neon is ready.
+    asyncio.create_task(_init_db())
     yield
 
 
@@ -51,7 +65,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows localhost dev + Vercel/Render production URLs
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
