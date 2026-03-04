@@ -1,4 +1,5 @@
 import asyncio
+import re
 from functools import partial
 from typing import Any
 
@@ -41,9 +42,21 @@ def _extract_price(data: pd.DataFrame, ticker: str, all_tickers: list[str]) -> f
 
 
 def _fetch_single(ticker: str) -> float:
-    """Download a single ticker and return its latest close price."""
+    """
+    Fetch a single ticker's latest price using yf.Ticker.history().
+    More reliable than batch download for small/SME-listed stocks.
+    """
     try:
-        data = yf.download(ticker, period="2d", auto_adjust=True, progress=False)
+        hist = yf.Ticker(ticker).history(period="5d", interval="1d")
+        if not hist.empty:
+            price = float(hist["Close"].dropna().iloc[-1])
+            if price > 0:
+                return price
+    except Exception:
+        pass
+    # secondary: try download for this one ticker
+    try:
+        data = yf.download(ticker, period="5d", auto_adjust=True, progress=False)
         if not data.empty:
             return float(data["Close"].dropna().iloc[-1])
     except Exception:
@@ -51,43 +64,83 @@ def _fetch_single(ticker: str) -> float:
     return 0.0
 
 
+def _clean_name_for_search(name: str) -> str:
+    """
+    Strip common corporate suffixes so screener.in / yfinance Search
+    can match the core company name more reliably.
+    """
+    name = name.strip()
+    suffixes = (
+        r"\s+(LIMITED|LTD\.?|LTD|CORP\.?|CORP|INDUSTRIES|ENTERPRISE[S]?|"
+        r"COMPANY|CO\.?|PVT\.?|PRIVATE|INC\.?|GROUP)\s*$"
+    )
+    name = re.sub(suffixes, "", name, flags=re.IGNORECASE).strip()
+    # Also strip trailing dots / brackets
+    name = re.sub(r"[\.\(\[]+$", "", name).strip()
+    return name
+
+
 def _yf_name_search(name: str) -> list[str]:
-    """Use yfinance Search (>= 0.2) to find tickers by company name."""
-    try:
-        results = yf.Search(name, max_results=5).quotes
-        return [q.get("symbol", "") for q in results if q.get("symbol")]
-    except Exception:
-        return []
+    """Use yfinance Search (>= 0.2) to find Indian stock tickers by name."""
+    results = []
+    for query in (name, _clean_name_for_search(name)):
+        if not query:
+            continue
+        try:
+            quotes = yf.Search(query, max_results=5).quotes
+            for q in quotes:
+                sym = q.get("symbol", "")
+                # Prefer Indian exchange symbols
+                if sym and (sym.endswith(".NS") or sym.endswith(".BO") or "." not in sym):
+                    if sym not in results:
+                        results.append(sym)
+        except Exception:
+            pass
+        if results:
+            break
+    return results
 
 
 def _screener_search(name: str) -> list[str]:
     """
     Search screener.in by company name.
-    Returns candidate ticker symbols (without exchange suffix) from the first few results.
+    Returns candidate ticker symbols (without exchange suffix).
     """
-    try:
-        resp = requests.get(
-            "https://www.screener.in/api/company/search/",
-            params={"q": name, "fields": "name,url", "limit": 5},
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Referer": "https://www.screener.in/",
-                "X-Requested-With": "XMLHttpRequest",
-            },
-            timeout=8,
-        )
-        if resp.ok:
-            symbols = []
-            for item in resp.json():
-                url = item.get("url", "")
-                # URL format: "company/SYMBOL/" or "/company/SYMBOL/consolidated/"
-                parts = [p for p in url.split("/") if p and p not in ("company", "consolidated")]
-                if parts:
-                    symbols.append(parts[0])
-            return symbols
-    except Exception:
-        pass
-    return []
+    symbols: list[str] = []
+    for query in (name, _clean_name_for_search(name)):
+        if not query:
+            continue
+        try:
+            resp = requests.get(
+                "https://www.screener.in/api/company/search/",
+                params={"q": query, "fields": "name,url", "limit": 5},
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                    "Referer": "https://www.screener.in/",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Accept": "application/json",
+                },
+                timeout=8,
+            )
+            if resp.ok:
+                for item in resp.json():
+                    url = item.get("url", "")
+                    # URL format: "company/SYMBOL/" or "/company/SYMBOL/consolidated/"
+                    parts = [
+                        p for p in url.split("/")
+                        if p and p not in ("company", "consolidated")
+                    ]
+                    if parts and parts[0] not in symbols:
+                        symbols.append(parts[0])
+        except Exception:
+            pass
+        if symbols:
+            break
+    return symbols
 
 
 # ── Public async API ───────────────────────────────────────────────────────────
@@ -97,16 +150,18 @@ async def get_current_prices(
     names: dict[str, str] | None = None,
 ) -> dict[str, float]:
     """
-    Fetch latest closing prices for a list of tickers.
+    Fetch latest closing prices for a list of Indian stock tickers.
 
     Fallback chain for any ticker returning 0:
       1. Alternate exchange suffix (.NS ↔ .BO)
-      2. yfinance Search by company name
-      3. screener.in search by company name → try .NS and .BO with found symbol
+      2. yf.Ticker.history() per individual ticker + alternate suffix
+      3. yfinance Search by company name
+      4. screener.in search by company name → try .NS and .BO
     """
     if not tickers:
         return {}
 
+    # ── Step 1: Batch download ────────────────────────────────────────────────
     data: pd.DataFrame = await _run_sync(_download, tickers, "2d")
     prices: dict[str, float] = {}
 
@@ -116,7 +171,7 @@ async def get_current_prices(
     else:
         prices = {t: 0.0 for t in tickers}
 
-    # Fallback 1: alternate exchange suffix (.NS ↔ .BO)
+    # ── Step 2: Alternate exchange suffix (.NS ↔ .BO) ────────────────────────
     failed = [t for t in tickers if prices.get(t, 0.0) == 0.0 and _alternate_suffix(t)]
     if failed:
         alt_map = {_alternate_suffix(t): t for t in failed}
@@ -128,15 +183,30 @@ async def get_current_prices(
                 if price > 0.0:
                     prices[orig] = price
 
-    # Fallback 2 & 3: name-based search for still-missing tickers
+    # ── Step 3: Individual yf.Ticker.history() for still-missing tickers ─────
+    still_failed = [t for t in tickers if prices.get(t, 0.0) == 0.0]
+    for ticker in still_failed:
+        # Try primary ticker via history()
+        price = await _run_sync(_fetch_single, ticker)
+        if price > 0.0:
+            prices[ticker] = price
+            continue
+        # Try alternate suffix via history()
+        alt = _alternate_suffix(ticker)
+        if alt:
+            price = await _run_sync(_fetch_single, alt)
+            if price > 0.0:
+                prices[ticker] = price
+
+    # ── Step 4: Name-based search for anything still at 0 ────────────────────
     if names:
         name_failed = [t for t in tickers if prices.get(t, 0.0) == 0.0 and names.get(t)]
         for ticker in name_failed:
             company_name = names[ticker]
-
-            # 2a. yfinance Search by name
-            candidates = await _run_sync(_yf_name_search, company_name)
             found = False
+
+            # 4a. yfinance Search by name
+            candidates = await _run_sync(_yf_name_search, company_name)
             for candidate in candidates:
                 price = await _run_sync(_fetch_single, candidate)
                 if price > 0.0:
@@ -147,7 +217,7 @@ async def get_current_prices(
             if found:
                 continue
 
-            # 2b. screener.in search → try .NS then .BO
+            # 4b. screener.in → try .NS then .BO
             screener_syms = await _run_sync(_screener_search, company_name)
             for sym in screener_syms:
                 for suffix in (".NS", ".BO"):
@@ -177,7 +247,6 @@ async def get_ticker_info(ticker: str) -> dict[str, Any]:
         info = await _run_sync(_ticker_info, ticker)
     except Exception:
         info = {}
-    # If primary ticker failed, try alternate exchange
     if not info.get("longName") and _alternate_suffix(ticker):
         try:
             info = await _run_sync(_ticker_info, _alternate_suffix(ticker))

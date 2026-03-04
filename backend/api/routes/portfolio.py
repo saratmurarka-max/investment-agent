@@ -446,6 +446,20 @@ async def upload_holdings_excel(
     if not holdings_to_add and not realized_to_add:
         raise HTTPException(400, "No valid positions found in the file.")
 
+    # ── Delete ALL existing holdings and realized P&L before re-importing ──────
+    existing_holdings = await db.execute(
+        select(Holding).where(Holding.portfolio_id == portfolio_id)
+    )
+    for h in existing_holdings.scalars().all():
+        await db.delete(h)
+
+    existing_pnl = await db.execute(
+        select(RealizedPnL).where(RealizedPnL.portfolio_id == portfolio_id)
+    )
+    for row in existing_pnl.scalars().all():
+        await db.delete(row)
+    # ──────────────────────────────────────────────────────────────────────────
+
     # Insert open holdings
     added_tickers = []
     for h in holdings_to_add:
@@ -458,13 +472,8 @@ async def upload_holdings_excel(
         ))
         added_tickers.append(h["ticker"])
 
-    # Insert realized P&L (replace existing for same ticker)
+    # Insert realized P&L
     if realized_to_add:
-        existing = await db.execute(
-            select(RealizedPnL).where(RealizedPnL.portfolio_id == portfolio_id)
-        )
-        for row in existing.scalars().all():
-            await db.delete(row)
 
         for r in realized_to_add:
             db.add(RealizedPnL(
