@@ -27,6 +27,7 @@ class Portfolio(Base):
     client_id: Mapped[int] = mapped_column(ForeignKey("clients.id"), index=True)
     name: Mapped[str] = mapped_column(String(255))
     currency: Mapped[str] = mapped_column(String(3), default="USD")
+    broker_client_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # e.g. "17010040"
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 

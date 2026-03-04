@@ -78,15 +78,46 @@ def _is_broker_format(rows: list) -> bool:
     return has_symbol and "purchase_qty" in headers
 
 
-def _parse_broker_format(rows: list) -> tuple[list[dict], list[dict], list[str]]:
+def _extract_client_info(rows: list, headers: list[str]) -> dict:
+    """
+    Extract broker client_id and client_name from the first data row.
+    Both equity and derivative PROFITMART files have Client_id and Client name columns.
+    Returns {"client_id": "17010040", "client_name": "SWATI SURESH GAIKWAD"} or {}.
+    """
+    cid_idx  = headers.index("client_id")   if "client_id"   in headers else -1
+    cname_idx = headers.index("client_name") if "client_name" in headers else -1
+
+    info: dict = {}
+    for row in rows[4:]:  # first data row is enough
+        try:
+            if cid_idx >= 0 and row[cid_idx] is not None:
+                raw = str(row[cid_idx]).strip()
+                # strip decimal suffix if it came through as float (e.g. "17010040.0")
+                if raw.endswith(".0"):
+                    raw = raw[:-2]
+                if raw and raw.upper() not in ("NONE", ""):
+                    info["client_id"] = raw
+            if cname_idx >= 0 and row[cname_idx] is not None:
+                raw = str(row[cname_idx]).strip()
+                if raw and raw.upper() not in ("NONE", ""):
+                    info["client_name"] = raw
+        except Exception:
+            pass
+        if info:
+            break  # found on first valid row — stop
+    return info
+
+
+def _parse_broker_format(rows: list) -> tuple[list[dict], list[dict], list[str], dict]:
     """
     Returns:
         holdings      - list of open positions {ticker, shares, avg_cost}
         realized_pnls - list of realized P&L per ticker {ticker, short_term_gain, long_term_gain}
         skipped       - list of skipped row descriptions
+        client_info   - {"client_id": ..., "client_name": ...} extracted from broker file
     """
     if len(rows) < 5:
-        return [], [], []
+        return [], [], [], {}
 
     headers = _normalise_headers(rows[3])
 
@@ -109,7 +140,9 @@ def _parse_broker_format(rows: list) -> tuple[list[dict], list[dict], list[str]]
         sym_idx = name_idx
 
     if any(i == -1 for i in [sym_idx, qty_idx, rate_idx]):
-        return [], [], ["Could not find required broker columns"]
+        return [], [], ["Could not find required broker columns"], {}
+
+    client_info = _extract_client_info(rows, headers)
 
     open_agg: dict[str, dict] = defaultdict(lambda: {"net_qty": 0.0, "cost_basis": 0.0, "name": ""})
     real_agg: dict[str, dict] = defaultdict(lambda: {"short_term": 0.0, "long_term": 0.0})
@@ -169,7 +202,7 @@ def _parse_broker_format(rows: list) -> tuple[list[dict], list[dict], list[str]]
         if data["short_term"] != 0 or data["long_term"] != 0
     ]
 
-    return holdings, realized_pnls, skipped
+    return holdings, realized_pnls, skipped, client_info
 
 
 # ── Derivative format ───────────────────────────────────────────────────────────
@@ -213,15 +246,16 @@ def _is_derivative_format(rows: list) -> bool:
     )
 
 
-def _parse_derivative_format(rows: list) -> tuple[list[dict], list[str]]:
+def _parse_derivative_format(rows: list) -> tuple[list[dict], list[str], dict]:
     """
     Parse a PROFITMART derivative P&L Excel.
     Returns:
-        trades  - list of trade dicts ready to be inserted as DerivativeTrade rows
-        skipped - list of skipped row descriptions
+        trades      - list of trade dicts ready to be inserted as DerivativeTrade rows
+        skipped     - list of skipped row descriptions
+        client_info - {"client_id": ..., "client_name": ...} extracted from the file
     """
     if len(rows) < 5:
-        return [], []
+        return [], [], {}
 
     headers = _normalise_headers(rows[3])
 
@@ -246,7 +280,9 @@ def _parse_derivative_format(rows: list) -> tuple[list[dict], list[str]]:
     loss_idx   = col(["booked_loss"])
 
     if sym_idx == -1:
-        return [], ["Could not find Scrip_Symbol column"]
+        return [], ["Could not find Scrip_Symbol column"], {}
+
+    client_info = _extract_client_info(rows, headers)
 
     def to_float(idx: int, row) -> float:
         if idx < 0 or idx >= len(row):
@@ -306,7 +342,7 @@ def _parse_derivative_format(rows: list) -> tuple[list[dict], list[str]]:
         except Exception:
             skipped.append(f"row {i}")
 
-    return trades, skipped
+    return trades, skipped, client_info
 
 
 # --- Routes ---
@@ -585,10 +621,11 @@ async def upload_holdings_excel(
             "Please use the 'Derivatives' tab to upload it."
         )
 
-    broker_fmt = _is_broker_format(rows)
+    broker_fmt  = _is_broker_format(rows)
+    client_info: dict = {}
 
     if broker_fmt:
-        holdings_to_add, realized_to_add, skipped = _parse_broker_format(rows)
+        holdings_to_add, realized_to_add, skipped, client_info = _parse_broker_format(rows)
     else:
         # Simple format
         headers = _normalise_headers(rows[0])
@@ -630,6 +667,17 @@ async def upload_holdings_excel(
     if not holdings_to_add and not realized_to_add:
         raise HTTPException(400, "No valid positions found in the file.")
 
+    # ── Update client name + broker_client_id from the file ───────────────────
+    broker_name = client_info.get("client_name", "").strip()
+    broker_cid  = client_info.get("client_id",   "").strip()
+    if broker_name:
+        client_obj = await db.get(Client, portfolio.client_id)
+        if client_obj:
+            client_obj.name = broker_name
+    if broker_cid:
+        portfolio.broker_client_id = broker_cid
+    # ─────────────────────────────────────────────────────────────────────────
+
     # ── Delete ALL existing holdings and realized P&L before re-importing ──────
     existing_holdings = await db.execute(
         select(Holding).where(Holding.portfolio_id == portfolio_id)
@@ -658,7 +706,6 @@ async def upload_holdings_excel(
 
     # Insert realized P&L
     if realized_to_add:
-
         for r in realized_to_add:
             db.add(RealizedPnL(
                 portfolio_id=portfolio_id,
@@ -673,6 +720,8 @@ async def upload_holdings_excel(
         "tickers": added_tickers,
         "realized_pnl_imported": len(realized_to_add),
         "skipped": skipped,
+        "client_name": broker_name or None,
+        "client_id":   broker_cid  or None,
         "format_detected": "broker" if broker_fmt else "simple",
     }
 
@@ -711,10 +760,33 @@ async def upload_derivatives_excel(
             "Expected INSTRUMENT_TYPE and Booked P/L columns (PROFITMART DER P&L format)."
         )
 
-    trades, skipped = _parse_derivative_format(rows)
+    trades, skipped, client_info = _parse_derivative_format(rows)
 
     if not trades:
         raise HTTPException(400, "No valid derivative trades found in the file.")
+
+    # ── Client ID cross-validation ─────────────────────────────────────────────
+    deriv_cid  = client_info.get("client_id",   "").strip()
+    deriv_name = client_info.get("client_name", "").strip()
+
+    if deriv_cid and portfolio.broker_client_id:
+        if str(deriv_cid) != str(portfolio.broker_client_id):
+            raise HTTPException(
+                400,
+                f"Client ID mismatch: the uploaded portfolio file belongs to client "
+                f"'{portfolio.broker_client_id}', but this Derivatives file belongs to "
+                f"client '{deriv_cid}' ({deriv_name}). "
+                f"Please upload the correct DER P&L file for the same client."
+            )
+
+    # ── Update client name from derivative file if not already set ────────────
+    if deriv_name:
+        client_obj = await db.get(Client, portfolio.client_id)
+        if client_obj and client_obj.name in ("Demo Client", "Client", ""):
+            client_obj.name = deriv_name
+    if deriv_cid and not portfolio.broker_client_id:
+        portfolio.broker_client_id = deriv_cid
+    # ─────────────────────────────────────────────────────────────────────────
 
     # Delete all existing derivative trades for this portfolio
     existing = await db.execute(
@@ -730,7 +802,9 @@ async def upload_derivatives_excel(
     await db.commit()
     return {
         "imported": len(trades),
-        "skipped": skipped,
+        "skipped":  skipped,
+        "client_name": deriv_name or None,
+        "client_id":   deriv_cid  or None,
     }
 
 
