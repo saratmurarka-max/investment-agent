@@ -10,7 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from backend.db.database import get_db
-from backend.db.models import Client, Holding, Portfolio
+from backend.db.models import Client, Holding, Portfolio, RealizedPnL
+from backend.services import market_data
 
 router = APIRouter(prefix="/portfolios", tags=["portfolios"])
 
@@ -38,33 +39,36 @@ class ClientIn(BaseModel):
 # --- Helpers ---
 
 def _normalise_headers(row) -> list[str]:
-    return [str(h).lower().strip().replace(" ", "_") if h else "" for h in row]
+    return [str(h).lower().strip().replace(" ", "_").replace("\\", "") if h else "" for h in row]
 
 
 def _to_nse_ticker(symbol: str) -> str:
-    """Convert a raw broker symbol to an NSE ticker (e.g. RELIANCE → RELIANCE.NS)."""
     symbol = symbol.strip().upper()
-    # Already has exchange suffix
     if symbol.endswith(".NS") or symbol.endswith(".BO"):
         return symbol
-    # BSE numeric code like 500285-EQ — keep as-is, yfinance won't know it anyway
     if re.match(r"^\d+(-EQ)?$", symbol):
         return symbol
     return symbol + ".NS"
 
 
-def _parse_broker_format(rows: list) -> tuple[list[dict], list[str]]:
-    """
-    Parse PROFITMART / broker portfolio report format.
-    Rows 1-3: metadata; Row 4 (index 3): headers; Rows 5+ (index 4+): data.
+def _is_broker_format(rows: list) -> bool:
+    if len(rows) < 4:
+        return False
+    headers = _normalise_headers(rows[3])
+    return "scrip_symbol" in headers and "purchase_qty" in headers
 
-    Extracts open / partially-open positions and aggregates by symbol.
-    Returns (holdings_list, skipped_list).
+
+def _parse_broker_format(rows: list) -> tuple[list[dict], list[dict], list[str]]:
+    """
+    Returns:
+        holdings      - list of open positions {ticker, shares, avg_cost}
+        realized_pnls - list of realized P&L per ticker {ticker, short_term_gain, long_term_gain}
+        skipped       - list of skipped row descriptions
     """
     if len(rows) < 5:
-        return [], []
+        return [], [], []
 
-    headers = _normalise_headers(rows[3])  # row 4 = index 3
+    headers = _normalise_headers(rows[3])
 
     def col(names: list[str]) -> int:
         for n in names:
@@ -72,17 +76,18 @@ def _parse_broker_format(rows: list) -> tuple[list[dict], list[str]]:
                 return headers.index(n)
         return -1
 
-    sym_idx      = col(["scrip_symbol"])
-    qty_idx      = col(["purchase_qty"])
-    rate_idx     = col(["purchase_rate"])
-    sell_qty_idx = col(["sell_qty"])
-    sell_date_idx = col(["sell_trade_date"])
+    sym_idx       = col(["scrip_symbol"])
+    qty_idx       = col(["purchase_qty"])
+    rate_idx      = col(["purchase_rate"])
+    sell_qty_idx  = col(["sell_qty"])
+    stcg_idx      = col(["shorterm_pl", "short_term_pl", "shorterm_p\\l"])
+    ltcg_idx      = col(["actual_longterm", "longterm_pl", "actual_longterm_pl"])
 
     if any(i == -1 for i in [sym_idx, qty_idx, rate_idx]):
-        return [], ["Could not find required broker columns (Scrip_Symbol, Purchase_Qty, Purchase_Rate)"]
+        return [], [], ["Could not find required broker columns"]
 
-    # Aggregate net open positions by symbol
-    agg: dict[str, dict] = defaultdict(lambda: {"net_qty": 0.0, "cost_basis": 0.0})
+    open_agg: dict[str, dict] = defaultdict(lambda: {"net_qty": 0.0, "cost_basis": 0.0})
+    real_agg: dict[str, dict] = defaultdict(lambda: {"short_term": 0.0, "long_term": 0.0})
     skipped: list[str] = []
 
     for i, row in enumerate(rows[4:], start=5):
@@ -98,34 +103,43 @@ def _parse_broker_format(rows: list) -> tuple[list[dict], list[str]]:
             if buy_qty <= 0:
                 continue
 
-            net_qty = buy_qty - sell_qty
-            if net_qty <= 0:
-                continue  # fully sold, skip
+            # Realized P&L for sold portion
+            if sell_qty > 0:
+                stcg = float(row[stcg_idx] or 0) if stcg_idx >= 0 else 0
+                ltcg = float(row[ltcg_idx] or 0) if ltcg_idx >= 0 else 0
+                real_agg[symbol]["short_term"] += stcg
+                real_agg[symbol]["long_term"]  += ltcg
 
-            agg[symbol]["net_qty"]    += net_qty
-            agg[symbol]["cost_basis"] += net_qty * buy_rate
+            # Open position (unsold portion)
+            net_qty = buy_qty - sell_qty
+            if net_qty > 0:
+                open_agg[symbol]["net_qty"]    += net_qty
+                open_agg[symbol]["cost_basis"] += net_qty * buy_rate
 
         except Exception:
             skipped.append(f"row {i}")
 
-    holdings = []
-    for symbol, data in agg.items():
-        if data["net_qty"] > 0:
-            holdings.append({
-                "ticker":   _to_nse_ticker(symbol),
-                "shares":   round(data["net_qty"], 6),
-                "avg_cost": round(data["cost_basis"] / data["net_qty"], 4),
-            })
+    holdings = [
+        {
+            "ticker":   _to_nse_ticker(sym),
+            "shares":   round(data["net_qty"], 6),
+            "avg_cost": round(data["cost_basis"] / data["net_qty"], 4),
+        }
+        for sym, data in open_agg.items()
+        if data["net_qty"] > 0
+    ]
 
-    return holdings, skipped
+    realized_pnls = [
+        {
+            "ticker":           _to_nse_ticker(sym),
+            "short_term_gain":  round(data["short_term"], 4),
+            "long_term_gain":   round(data["long_term"], 4),
+        }
+        for sym, data in real_agg.items()
+        if data["short_term"] != 0 or data["long_term"] != 0
+    ]
 
-
-def _is_broker_format(rows: list) -> bool:
-    """Detect broker format by looking for Scrip_Symbol in row 4 (index 3)."""
-    if len(rows) < 4:
-        return False
-    headers = _normalise_headers(rows[3])
-    return "scrip_symbol" in headers and "purchase_qty" in headers
+    return holdings, realized_pnls, skipped
 
 
 # --- Routes ---
@@ -165,10 +179,8 @@ async def create_portfolio(
     portfolio = Portfolio(client_id=client_id, name=body.name, currency=body.currency)
     db.add(portfolio)
     await db.flush()
-
     for h in body.holdings:
         db.add(Holding(portfolio_id=portfolio.id, **h.model_dump()))
-
     await db.commit()
     await db.refresh(portfolio)
     return {"id": portfolio.id, "name": portfolio.name}
@@ -201,11 +213,102 @@ async def get_portfolio(portfolio_id: int, db: AsyncSession = Depends(get_db)):
     }
 
 
+@router.get("/{portfolio_id}/pnl")
+async def get_portfolio_pnl(portfolio_id: int, db: AsyncSession = Depends(get_db)):
+    """
+    Returns per-holding P&L (unrealized) using live prices + total realized P&L.
+    """
+    result = await db.execute(
+        select(Portfolio)
+        .options(selectinload(Portfolio.holdings))
+        .where(Portfolio.id == portfolio_id)
+    )
+    portfolio = result.scalar_one_or_none()
+    if not portfolio:
+        raise HTTPException(404, "Portfolio not found")
+
+    holdings = portfolio.holdings
+    if not holdings:
+        return {
+            "holdings": [],
+            "summary": {
+                "total_invested": 0,
+                "total_current_value": 0,
+                "total_unrealized_gain": 0,
+                "total_unrealized_pct": 0,
+                "total_realized_gain": 0,
+                "total_short_term_gain": 0,
+                "total_long_term_gain": 0,
+            }
+        }
+
+    # Fetch live prices for all tickers
+    tickers = [h.ticker for h in holdings]
+    try:
+        current_prices = await market_data.get_current_prices(tickers)
+    except Exception:
+        current_prices = {}
+
+    # Compute unrealized P&L per holding
+    holding_pnl = []
+    total_invested = 0.0
+    total_current_value = 0.0
+
+    for h in holdings:
+        avg_cost = float(h.avg_cost)
+        shares   = float(h.shares)
+        price    = current_prices.get(h.ticker, 0.0)
+
+        invested      = avg_cost * shares
+        current_value = price * shares
+        unrealized    = current_value - invested
+        pct           = ((price - avg_cost) / avg_cost * 100) if avg_cost > 0 and price > 0 else 0.0
+
+        holding_pnl.append({
+            "id":              h.id,
+            "ticker":          h.ticker,
+            "shares":          shares,
+            "avg_cost":        avg_cost,
+            "current_price":   price,
+            "invested":        round(invested, 2),
+            "current_value":   round(current_value, 2),
+            "unrealized_gain": round(unrealized, 2),
+            "unrealized_pct":  round(pct, 2),
+        })
+
+        total_invested      += invested
+        total_current_value += current_value
+
+    # Fetch realized P&L stored from broker uploads
+    real_result = await db.execute(
+        select(RealizedPnL).where(RealizedPnL.portfolio_id == portfolio_id)
+    )
+    realized_rows = real_result.scalars().all()
+    total_stcg = sum(float(r.short_term_gain) for r in realized_rows)
+    total_ltcg = sum(float(r.long_term_gain)  for r in realized_rows)
+    total_realized = total_stcg + total_ltcg
+
+    total_unrealized = total_current_value - total_invested
+    total_unrealized_pct = (total_unrealized / total_invested * 100) if total_invested > 0 else 0.0
+
+    return {
+        "holdings": holding_pnl,
+        "summary": {
+            "total_invested":      round(total_invested, 2),
+            "total_current_value": round(total_current_value, 2),
+            "total_unrealized_gain": round(total_unrealized, 2),
+            "total_unrealized_pct":  round(total_unrealized_pct, 2),
+            "total_realized_gain":   round(total_realized, 2),
+            "total_short_term_gain": round(total_stcg, 2),
+            "total_long_term_gain":  round(total_ltcg, 2),
+        },
+    }
+
+
 @router.post("/{portfolio_id}/holdings")
 async def add_holding(
     portfolio_id: int, body: HoldingIn, db: AsyncSession = Depends(get_db)
 ):
-    """Add a single holding manually."""
     portfolio = await db.get(Portfolio, portfolio_id)
     if not portfolio:
         raise HTTPException(404, "Portfolio not found")
@@ -231,7 +334,6 @@ async def add_holding(
 async def delete_holding(
     portfolio_id: int, holding_id: int, db: AsyncSession = Depends(get_db)
 ):
-    """Delete a single holding by ID."""
     holding = await db.get(Holding, holding_id)
     if not holding or holding.portfolio_id != portfolio_id:
         raise HTTPException(404, "Holding not found")
@@ -247,18 +349,14 @@ async def upload_holdings_excel(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Upload an Excel file (.xlsx) to bulk-add holdings.
+    Supports two Excel formats:
 
-    Supports two formats:
-
-    1. BROKER FORMAT (PROFITMART / similar):
-       - Rows 1-3: metadata (broker name, report title, date)
-       - Row 4: headers including Scrip_Symbol, Purchase_Qty, Purchase_Rate, Sell_Qty
-       - Automatically extracts open positions, aggregates by symbol, adds .NS suffix
+    1. BROKER FORMAT (PROFITMART / similar broker reports):
+       - Rows 1-3: metadata; Row 4: headers with Scrip_Symbol, Purchase_Qty, etc.
+       - Automatically extracts open positions + realized P&L
 
     2. SIMPLE FORMAT:
-       - Row 1: headers — Ticker | Shares | Avg Cost
-       - Row 2+: data rows
+       - Row 1: Ticker | Shares | Avg Cost
     """
     if not file.filename or not file.filename.endswith(".xlsx"):
         raise HTTPException(400, "Only .xlsx files are supported")
@@ -278,9 +376,10 @@ async def upload_holdings_excel(
     if len(rows) < 2:
         raise HTTPException(400, "File must have a header row and at least one data row.")
 
-    # --- Detect and parse format ---
-    if _is_broker_format(rows):
-        holdings_to_add, skipped = _parse_broker_format(rows)
+    broker_fmt = _is_broker_format(rows)
+
+    if broker_fmt:
+        holdings_to_add, realized_to_add, skipped = _parse_broker_format(rows)
     else:
         # Simple format
         headers = _normalise_headers(rows[0])
@@ -293,8 +392,8 @@ async def upload_holdings_excel(
 
         ticker_idx = find_col(["ticker", "symbol", "stock", "scrip_symbol"])
         shares_idx = find_col(["shares", "quantity", "qty", "units", "purchase_qty"])
-        cost_idx   = find_col(["avg_cost", "average_cost", "avg_cost_per_share",
-                                "cost", "price", "buy_price", "purchase_rate"])
+        cost_idx   = find_col(["avg_cost", "average_cost", "cost", "price",
+                                "buy_price", "purchase_rate"])
 
         missing = []
         if ticker_idx == -1: missing.append("ticker/symbol")
@@ -307,7 +406,7 @@ async def upload_holdings_excel(
                 f"Headers found: {', '.join(h for h in headers if h)}"
             )
 
-        holdings_to_add, skipped = [], []
+        holdings_to_add, realized_to_add, skipped = [], [], []
         for i, row in enumerate(rows[1:], start=2):
             try:
                 ticker   = str(row[ticker_idx]).upper().strip()
@@ -319,10 +418,11 @@ async def upload_holdings_excel(
             except Exception:
                 skipped.append(f"row {i}")
 
-    if not holdings_to_add:
-        raise HTTPException(400, "No valid open positions found in the file.")
+    if not holdings_to_add and not realized_to_add:
+        raise HTTPException(400, "No valid positions found in the file.")
 
-    added = []
+    # Insert open holdings
+    added_tickers = []
     for h in holdings_to_add:
         db.add(Holding(
             portfolio_id=portfolio_id,
@@ -330,12 +430,29 @@ async def upload_holdings_excel(
             shares=h["shares"],
             avg_cost=h["avg_cost"],
         ))
-        added.append(h["ticker"])
+        added_tickers.append(h["ticker"])
+
+    # Insert realized P&L (replace existing for same ticker)
+    if realized_to_add:
+        existing = await db.execute(
+            select(RealizedPnL).where(RealizedPnL.portfolio_id == portfolio_id)
+        )
+        for row in existing.scalars().all():
+            await db.delete(row)
+
+        for r in realized_to_add:
+            db.add(RealizedPnL(
+                portfolio_id=portfolio_id,
+                ticker=r["ticker"],
+                short_term_gain=r["short_term_gain"],
+                long_term_gain=r["long_term_gain"],
+            ))
 
     await db.commit()
     return {
-        "added": len(added),
-        "tickers": added,
+        "added": len(added_tickers),
+        "tickers": added_tickers,
+        "realized_pnl_imported": len(realized_to_add),
         "skipped": skipped,
-        "format_detected": "broker" if _is_broker_format(rows) else "simple",
+        "format_detected": "broker" if broker_fmt else "simple",
     }
