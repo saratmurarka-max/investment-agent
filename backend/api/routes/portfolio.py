@@ -1,7 +1,7 @@
 import io
 import re
 from collections import defaultdict
-from datetime import date as date_type
+from datetime import date as date_type, datetime
 
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from backend.db.database import get_db
-from backend.db.models import Client, Holding, Portfolio, RealizedPnL
+from backend.db.models import Client, Holding, Portfolio, RealizedPnL, DerivativeTrade
 from backend.services import market_data
 
 router = APIRouter(prefix="/portfolios", tags=["portfolios"])
@@ -65,10 +65,15 @@ def _to_exchange_ticker(symbol: str) -> str:
     return symbol + ".NS"
 
 
+# ── Equity broker format ────────────────────────────────────────────────────────
+
 def _is_broker_format(rows: list) -> bool:
     if len(rows) < 4:
         return False
     headers = _normalise_headers(rows[3])
+    # Derivative files also have scrip_symbol + purchase_qty — exclude them
+    if "instrument_type" in headers:
+        return False
     has_symbol = "scrip_symbol" in headers or "scrip_name" in headers
     return has_symbol and "purchase_qty" in headers
 
@@ -165,6 +170,143 @@ def _parse_broker_format(rows: list) -> tuple[list[dict], list[dict], list[str]]
     ]
 
     return holdings, realized_pnls, skipped
+
+
+# ── Derivative format ───────────────────────────────────────────────────────────
+
+# Matches: "IO CE NIFTY 02Dec2025 26600" or "IO PE NIFTY 31Jul2025 24300"
+_DERIV_RE = re.compile(
+    r"^(?:IO|ST|IX)\s+(CE|PE|FU|CA|PA)\s+(\w+)\s+(\d{2}\w{3}\d{4})(?:\s+(\d+(?:\.\d+)?))?",
+    re.IGNORECASE,
+)
+
+
+def _parse_scrip_symbol(symbol: str) -> dict:
+    """Extract option_type, underlying, expiry_date, strike_price from a scrip symbol."""
+    m = _DERIV_RE.search(symbol.strip())
+    if not m:
+        return {"option_type": None, "underlying": None, "expiry_date": None, "strike_price": None}
+    option_type = m.group(1).upper()
+    underlying  = m.group(2).upper()
+    expiry_str  = m.group(3)
+    strike_str  = m.group(4)
+    try:
+        expiry = datetime.strptime(expiry_str, "%d%b%Y")
+    except Exception:
+        expiry = None
+    strike = float(strike_str) if strike_str else None
+    return {
+        "option_type":  option_type,
+        "underlying":   underlying,
+        "expiry_date":  expiry,
+        "strike_price": strike,
+    }
+
+
+def _is_derivative_format(rows: list) -> bool:
+    """Detect PROFITMART-style Derivative P&L Excel (DER P&L report)."""
+    if len(rows) < 4:
+        return False
+    headers = _normalise_headers(rows[3])
+    return "instrument_type" in headers and any(
+        h in headers for h in ["booked_p/l", "booked_pl", "booked_profit"]
+    )
+
+
+def _parse_derivative_format(rows: list) -> tuple[list[dict], list[str]]:
+    """
+    Parse a PROFITMART derivative P&L Excel.
+    Returns:
+        trades  - list of trade dicts ready to be inserted as DerivativeTrade rows
+        skipped - list of skipped row descriptions
+    """
+    if len(rows) < 5:
+        return [], []
+
+    headers = _normalise_headers(rows[3])
+
+    def col(names: list[str]) -> int:
+        for n in names:
+            if n in headers:
+                return headers.index(n)
+        return -1
+
+    sym_idx    = col(["scrip_symbol"])
+    inst_idx   = col(["instrument_type"])
+    tdate_idx  = col(["trade_date"])
+    bqty_idx   = col(["purchase_qty"])
+    brate_idx  = col(["purchase_rate"])
+    bamt_idx   = col(["purchase_amount"])
+    sdate_idx  = col(["sell_trade_date"])
+    sqty_idx   = col(["sell_qty"])
+    srate_idx  = col(["sell_rate"])
+    samt_idx   = col(["sell_amount"])
+    pnl_idx    = col(["booked_p/l", "booked_pl"])
+    profit_idx = col(["booked_profit"])
+    loss_idx   = col(["booked_loss"])
+
+    if sym_idx == -1:
+        return [], ["Could not find Scrip_Symbol column"]
+
+    def to_float(idx: int, row) -> float:
+        if idx < 0 or idx >= len(row):
+            return 0.0
+        v = row[idx]
+        if v is None:
+            return 0.0
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+
+    def to_dt(idx: int, row):
+        if idx < 0 or idx >= len(row):
+            return None
+        v = row[idx]
+        if v is None:
+            return None
+        if isinstance(v, datetime):
+            return v
+        try:
+            return datetime.strptime(str(v), "%Y-%m-%d")
+        except Exception:
+            return None
+
+    trades: list[dict] = []
+    skipped: list[str] = []
+
+    for i, row in enumerate(rows[4:], start=5):
+        try:
+            symbol = str(row[sym_idx] or "").strip()
+            if not symbol or symbol.upper() == "NONE":
+                continue
+
+            parsed = _parse_scrip_symbol(symbol)
+            inst   = str(row[inst_idx] or "").strip() if inst_idx >= 0 else None
+
+            trades.append({
+                "scrip_symbol":    symbol,
+                "instrument_type": inst,
+                "option_type":     parsed["option_type"],
+                "underlying":      parsed["underlying"],
+                "expiry_date":     parsed["expiry_date"],
+                "strike_price":    parsed["strike_price"],
+                "trade_date":      to_dt(tdate_idx, row),
+                "buy_qty":         to_float(bqty_idx, row),
+                "buy_rate":        to_float(brate_idx, row),
+                "buy_amount":      to_float(bamt_idx, row),
+                "sell_date":       to_dt(sdate_idx, row),
+                "sell_qty":        to_float(sqty_idx, row),
+                "sell_rate":       to_float(srate_idx, row),
+                "sell_amount":     to_float(samt_idx, row),
+                "booked_pnl":      to_float(pnl_idx, row),
+                "booked_profit":   to_float(profit_idx, row),
+                "booked_loss":     to_float(loss_idx, row),
+            })
+        except Exception:
+            skipped.append(f"row {i}")
+
+    return trades, skipped
 
 
 # --- Routes ---
@@ -366,6 +508,29 @@ async def add_holding(
     }
 
 
+@router.delete("/{portfolio_id}/holdings")
+async def clear_all_holdings(portfolio_id: int, db: AsyncSession = Depends(get_db)):
+    """Delete ALL holdings and realized P&L for a portfolio (fresh start)."""
+    portfolio = await db.get(Portfolio, portfolio_id)
+    if not portfolio:
+        raise HTTPException(404, "Portfolio not found")
+
+    h_result = await db.execute(select(Holding).where(Holding.portfolio_id == portfolio_id))
+    holdings_count = 0
+    for h in h_result.scalars().all():
+        await db.delete(h)
+        holdings_count += 1
+
+    pnl_result = await db.execute(select(RealizedPnL).where(RealizedPnL.portfolio_id == portfolio_id))
+    pnl_count = 0
+    for r in pnl_result.scalars().all():
+        await db.delete(r)
+        pnl_count += 1
+
+    await db.commit()
+    return {"deleted_holdings": holdings_count, "deleted_pnl_rows": pnl_count}
+
+
 @router.delete("/{portfolio_id}/holdings/{holding_id}")
 async def delete_holding(
     portfolio_id: int, holding_id: int, db: AsyncSession = Depends(get_db)
@@ -411,6 +576,14 @@ async def upload_holdings_excel(
 
     if len(rows) < 2:
         raise HTTPException(400, "File must have a header row and at least one data row.")
+
+    # Reject derivative files — use the dedicated /derivatives/upload endpoint
+    if _is_derivative_format(rows):
+        raise HTTPException(
+            400,
+            "This looks like a Derivatives P&L file. "
+            "Please use the 'Derivatives' tab to upload it."
+        )
 
     broker_fmt = _is_broker_format(rows)
 
@@ -504,14 +677,192 @@ async def upload_holdings_excel(
     }
 
 
+# ── Derivative Endpoints ────────────────────────────────────────────────────────
+
+@router.post("/{portfolio_id}/derivatives/upload")
+async def upload_derivatives_excel(
+    portfolio_id: int,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Upload a PROFITMART Derivative P&L Excel (DER P&L report).
+    Replaces all existing derivative trades for this portfolio.
+    """
+    if not file.filename or not file.filename.endswith(".xlsx"):
+        raise HTTPException(400, "Only .xlsx files are supported")
+
+    portfolio = await db.get(Portfolio, portfolio_id)
+    if not portfolio:
+        raise HTTPException(404, "Portfolio not found")
+
+    contents = await file.read()
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(contents), read_only=True, data_only=True)
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+    except Exception:
+        raise HTTPException(400, "Could not read Excel file.")
+
+    if not _is_derivative_format(rows):
+        raise HTTPException(
+            400,
+            "File does not appear to be a Derivative P&L report. "
+            "Expected INSTRUMENT_TYPE and Booked P/L columns (PROFITMART DER P&L format)."
+        )
+
+    trades, skipped = _parse_derivative_format(rows)
+
+    if not trades:
+        raise HTTPException(400, "No valid derivative trades found in the file.")
+
+    # Delete all existing derivative trades for this portfolio
+    existing = await db.execute(
+        select(DerivativeTrade).where(DerivativeTrade.portfolio_id == portfolio_id)
+    )
+    for t in existing.scalars().all():
+        await db.delete(t)
+
+    # Insert new trades
+    for t in trades:
+        db.add(DerivativeTrade(portfolio_id=portfolio_id, **t))
+
+    await db.commit()
+    return {
+        "imported": len(trades),
+        "skipped": skipped,
+    }
+
+
+@router.get("/{portfolio_id}/derivatives/pnl")
+async def get_derivatives_pnl(portfolio_id: int, db: AsyncSession = Depends(get_db)):
+    """Returns aggregate F&O P&L stats for the portfolio."""
+    portfolio = await db.get(Portfolio, portfolio_id)
+    if not portfolio:
+        raise HTTPException(404, "Portfolio not found")
+
+    result = await db.execute(
+        select(DerivativeTrade).where(DerivativeTrade.portfolio_id == portfolio_id)
+    )
+    trades = result.scalars().all()
+
+    if not trades:
+        return {
+            "total_trades": 0,
+            "total_booked_pnl": 0,
+            "total_profit": 0,
+            "total_loss": 0,
+            "winning_trades": 0,
+            "losing_trades": 0,
+            "by_month": [],
+            "by_option_type": [],
+            "best_trade": None,
+            "worst_trade": None,
+        }
+
+    total_pnl    = sum(float(t.booked_pnl)    for t in trades)
+    total_profit = sum(float(t.booked_profit) for t in trades)
+    total_loss   = sum(float(t.booked_loss)   for t in trades)
+    winning      = sum(1 for t in trades if float(t.booked_pnl) > 0)
+    losing       = sum(1 for t in trades if float(t.booked_pnl) < 0)
+
+    # Monthly aggregation
+    monthly: dict = defaultdict(lambda: {"pnl": 0.0, "profit": 0.0, "loss": 0.0, "trades": 0})
+    for t in trades:
+        key = t.trade_date.strftime("%Y-%m") if t.trade_date else "Unknown"
+        monthly[key]["pnl"]    += float(t.booked_pnl)
+        monthly[key]["profit"] += float(t.booked_profit)
+        monthly[key]["loss"]   += float(t.booked_loss)
+        monthly[key]["trades"] += 1
+
+    by_month = [
+        {
+            "month":  k,
+            "pnl":    round(v["pnl"], 2),
+            "profit": round(v["profit"], 2),
+            "loss":   round(v["loss"], 2),
+            "trades": v["trades"],
+        }
+        for k, v in sorted(monthly.items())
+    ]
+
+    # CE / PE aggregation
+    by_type_agg: dict = defaultdict(lambda: {"pnl": 0.0, "trades": 0})
+    for t in trades:
+        ot = t.option_type or "Other"
+        by_type_agg[ot]["pnl"]    += float(t.booked_pnl)
+        by_type_agg[ot]["trades"] += 1
+
+    by_option_type = [
+        {"type": k, "pnl": round(v["pnl"], 2), "trades": v["trades"]}
+        for k, v in sorted(by_type_agg.items())
+    ]
+
+    # Best / worst single trades
+    sorted_by_pnl = sorted(trades, key=lambda t: float(t.booked_pnl))
+    worst = sorted_by_pnl[0]
+    best  = sorted_by_pnl[-1]
+
+    def trade_dict(t) -> dict:
+        return {
+            "scrip_symbol": t.scrip_symbol,
+            "option_type":  t.option_type,
+            "underlying":   t.underlying,
+            "strike_price": float(t.strike_price) if t.strike_price else None,
+            "trade_date":   t.trade_date.strftime("%d-%b-%Y") if t.trade_date else None,
+            "buy_qty":      float(t.buy_qty),
+            "buy_rate":     float(t.buy_rate),
+            "sell_rate":    float(t.sell_rate),
+            "booked_pnl":   round(float(t.booked_pnl), 2),
+        }
+
+    return {
+        "total_trades":     len(trades),
+        "total_booked_pnl": round(total_pnl, 2),
+        "total_profit":     round(total_profit, 2),
+        "total_loss":       round(total_loss, 2),
+        "winning_trades":   winning,
+        "losing_trades":    losing,
+        "by_month":         by_month,
+        "by_option_type":   by_option_type,
+        "best_trade":       trade_dict(best),
+        "worst_trade":      trade_dict(worst),
+    }
+
+
+@router.delete("/{portfolio_id}/derivatives")
+async def clear_derivatives(portfolio_id: int, db: AsyncSession = Depends(get_db)):
+    """Delete all derivative trades for a portfolio."""
+    portfolio = await db.get(Portfolio, portfolio_id)
+    if not portfolio:
+        raise HTTPException(404, "Portfolio not found")
+
+    result = await db.execute(
+        select(DerivativeTrade).where(DerivativeTrade.portfolio_id == portfolio_id)
+    )
+    count = 0
+    for t in result.scalars().all():
+        await db.delete(t)
+        count += 1
+    await db.commit()
+    return {"deleted": count}
+
+
 # ── Tax Report ─────────────────────────────────────────────────────────────────
 
-def _tax_excel(client_name: str, holdings, realized_rows, prices: dict) -> openpyxl.Workbook:
+def _tax_excel(
+    client_name: str,
+    holdings,
+    realized_rows,
+    prices: dict,
+    deriv_summary: dict | None = None,
+) -> openpyxl.Workbook:
     """
-    Generate a tax filing workbook with three sheets:
-      1. Tax Summary        – AY, STCG/LTCG totals, estimated tax liability
+    Generate a tax filing workbook with sheets:
+      1. Tax Summary        – AY, STCG/LTCG totals, F&O, estimated tax liability
       2. Realized Gains     – Per-stock STCG and LTCG breakdown
       3. Open Positions     – Unrealized P&L on current holdings
+      4. F&O Trades         – Monthly derivative P&L (if deriv_summary provided)
     """
     wb = openpyxl.Workbook()
 
@@ -524,6 +875,7 @@ def _tax_excel(client_name: str, holdings, realized_rows, prices: dict) -> openp
     GRAY   = "F5F5F5"
     WHITE  = "FFFFFF"
     BLACK  = "000000"
+    ORANGE = "7B3800"
 
     def hdr_font(bold=True, color=WHITE, sz=11):
         return Font(bold=bold, color=color, size=sz, name="Calibri")
@@ -568,13 +920,13 @@ def _tax_excel(client_name: str, holdings, realized_rows, prices: dict) -> openp
     AY = "2026-27"
     today = date_type.today().strftime("%d-%b-%Y")
 
-    # ── Compute totals ─────────────────────────────────────────────────────────
+    # ── Compute equity totals ──────────────────────────────────────────────────
     total_stcg = sum(float(r.short_term_gain) for r in realized_rows)
     total_ltcg = sum(float(r.long_term_gain)  for r in realized_rows)
-    ltcg_exempt   = min(max(total_ltcg, 0), 125_000)          # ₹1,25,000 exemption
+    ltcg_exempt   = min(max(total_ltcg, 0), 125_000)
     ltcg_taxable  = max(total_ltcg - ltcg_exempt, 0)
-    tax_stcg      = max(total_stcg, 0) * 0.20                 # 20% on STCG
-    tax_ltcg      = ltcg_taxable * 0.125                      # 12.5% on taxable LTCG
+    tax_stcg      = max(total_stcg, 0) * 0.20
+    tax_ltcg      = ltcg_taxable * 0.125
     total_tax_est = tax_stcg + tax_ltcg
 
     total_invested = sum(float(h.avg_cost) * float(h.shares) for h in holdings)
@@ -599,7 +951,7 @@ def _tax_excel(client_name: str, holdings, realized_rows, prices: dict) -> openp
     ws.row_dimensions[2].height = 30
     ws.merge_cells("B2:C2")
     t = ws["B2"]
-    t.value = f"Capital Gains Tax Report — FY {FY}  |  AY {AY}"
+    t.value = f"Capital Gains & F&O Tax Report — FY {FY}  |  AY {AY}"
     t.font  = Font(bold=True, color=WHITE, size=14, name="Calibri")
     t.fill  = fill(NAVY)
     t.alignment = center()
@@ -616,10 +968,10 @@ def _tax_excel(client_name: str, holdings, realized_rows, prices: dict) -> openp
         label(ws, r, 2, lbl, bold=True, bg=LBLUE)
         label(ws, r, 3, val)
 
-    # Spacer
+    # Spacer row 7
     ws.row_dimensions[7].height = 10
 
-    # ── Section: Realized Capital Gains ───────────────────────────────────────
+    # ── Section A: Realized Capital Gains ─────────────────────────────────────
     ws.row_dimensions[8].height = 20
     ws.merge_cells("B8:C8")
     sh = ws["B8"]
@@ -638,18 +990,18 @@ def _tax_excel(client_name: str, holdings, realized_rows, prices: dict) -> openp
         color = GREEN if val >= 0 else RED
         inr(ws, i, 3, val, color=color)
 
-    # ── Section: Tax Estimate ─────────────────────────────────────────────────
+    # ── Section B: Tax Estimate ────────────────────────────────────────────────
     ws.row_dimensions[13].height = 10
     ws.row_dimensions[14].height = 20
     ws.merge_cells("B14:C14")
     sh2 = ws["B14"]
-    sh2.value = "Section B — Estimated Tax Liability"
+    sh2.value = "Section B — Estimated Tax Liability (Equity Capital Gains)"
     sh2.font, sh2.fill, sh2.alignment, sh2.border = hdr_font(), fill(BLUE), center(), thin_border()
 
     tax_rows = [
         ("Tax on STCG @ 20%  (Section 111A)",   tax_stcg),
         ("Tax on LTCG @ 12.5%  (Section 112A)", tax_ltcg),
-        ("Total Estimated Tax",                  total_tax_est),
+        ("Total Estimated Tax (Equity)",         total_tax_est),
     ]
     for i, (lbl_text, val) in enumerate(tax_rows, start=15):
         ws.row_dimensions[i].height = 18
@@ -659,7 +1011,7 @@ def _tax_excel(client_name: str, holdings, realized_rows, prices: dict) -> openp
         if bold:
             ws.cell(row=i, column=2).font = cell_font(bold=True)
 
-    # ── Section: Open Positions Summary ───────────────────────────────────────
+    # ── Section C: Open Positions Summary ─────────────────────────────────────
     ws.row_dimensions[18].height = 10
     ws.row_dimensions[19].height = 20
     ws.merge_cells("B19:C19")
@@ -677,11 +1029,54 @@ def _tax_excel(client_name: str, holdings, realized_rows, prices: dict) -> openp
         label(ws, i, 2, lbl_text, bg=GRAY)
         inr(ws, i, 3, val, color=GREEN if val >= 0 else RED)
 
+    next_row = 23  # tracks next available row
+
+    # ── Section D: F&O P&L (optional) ─────────────────────────────────────────
+    if deriv_summary:
+        d_net    = deriv_summary["total_pnl"]
+        d_profit = deriv_summary["total_profit"]
+        d_loss   = deriv_summary["total_loss"]
+        d_trades = deriv_summary["total_trades"]
+
+        ws.row_dimensions[next_row].height = 10  # spacer
+        next_row += 1
+
+        ws.row_dimensions[next_row].height = 20
+        ws.merge_cells(f"B{next_row}:C{next_row}")
+        sh4 = ws[f"B{next_row}"]
+        sh4.value = "Section D — F&O / Derivatives Trading P&L"
+        sh4.font, sh4.fill, sh4.alignment, sh4.border = hdr_font(), fill(BLUE), center(), thin_border()
+        next_row += 1
+
+        fo_rows = [
+            ("Gross Booked Profit (F&O)",  d_profit),
+            ("Gross Booked Loss (F&O)",   -d_loss),
+            ("Net F&O P&L",               d_net),
+        ]
+        for lbl_text, val in fo_rows:
+            ws.row_dimensions[next_row].height = 18
+            label(ws, next_row, 2, lbl_text, bg=GRAY)
+            inr(ws, next_row, 3, val, color=GREEN if val >= 0 else RED)
+            next_row += 1
+
+        # Informational note
+        ws.row_dimensions[next_row].height = 20
+        ws.merge_cells(f"B{next_row}:C{next_row}")
+        note4 = ws[f"B{next_row}"]
+        note4.value = (
+            f"ℹ  F&O income ({d_trades} trades) is taxable as Business Income "
+            "(non-speculative) under head PGBP. Consult a CA for ITR-3 filing."
+        )
+        note4.font = Font(italic=True, color=ORANGE, size=9, name="Calibri")
+        note4.alignment = Alignment(wrap_text=True, vertical="center")
+        next_row += 1
+
     # Disclaimer
-    ws.row_dimensions[23].height = 10
-    ws.row_dimensions[24].height = 30
-    ws.merge_cells("B24:C24")
-    disc = ws["B24"]
+    ws.row_dimensions[next_row].height = 10    # spacer
+    next_row += 1
+    ws.row_dimensions[next_row].height = 30
+    ws.merge_cells(f"B{next_row}:C{next_row}")
+    disc = ws[f"B{next_row}"]
     disc.value = (
         "⚠  Disclaimer: Tax rates as per Finance Act 2024 (STCG 20%, LTCG 12.5% with ₹1.25L "
         "exemption). Figures are computed from broker-uploaded data. Please verify with a "
@@ -698,14 +1093,12 @@ def _tax_excel(client_name: str, holdings, realized_rows, prices: dict) -> openp
     for i, w in enumerate(COL_WIDTHS2, 1):
         ws2.column_dimensions[get_column_letter(i)].width = w
 
-    # Sheet title
     ws2.row_dimensions[2].height = 26
     ws2.merge_cells("B2:G2")
     t2 = ws2["B2"]
     t2.value = f"Realized Capital Gains — FY {FY}  (Equity)"
     t2.font, t2.fill, t2.alignment, t2.border = hdr_font(sz=12), fill(NAVY), center(), thin_border()
 
-    # Column headers
     headers2 = ["#", "Stock Name", "Ticker", "STCG (₹)", "LTCG (₹)", "Tax Est. STCG", "Tax Est. LTCG"]
     ws2.row_dimensions[3].height = 20
     for col, hdr in enumerate(headers2, 2):
@@ -720,7 +1113,6 @@ def _tax_excel(client_name: str, holdings, realized_rows, prices: dict) -> openp
         t_ltcg = max(ltcg, 0) * 0.125
         bg = WHITE if idx % 2 == 0 else GRAY
 
-        # Find display name from holdings
         h_match = next((h for h in holdings if h.ticker == r.ticker), None)
         dname = (h_match.name or r.ticker) if h_match else r.ticker
         ticker_display = r.ticker.replace(".NS", "").replace(".BO", "")
@@ -730,7 +1122,7 @@ def _tax_excel(client_name: str, holdings, realized_rows, prices: dict) -> openp
             c = ws2.cell(row=row, column=col, value=val)
             c.border = thin_border()
             c.fill   = fill(bg)
-            if col in (5, 6, 7, 8):           # numeric columns
+            if col in (5, 6, 7, 8):
                 c.number_format = u'₹#,##0.00'
                 c.alignment = right_align()
                 c.font = cell_font(color=GREEN if float(val) >= 0 else RED)
@@ -749,7 +1141,6 @@ def _tax_excel(client_name: str, holdings, realized_rows, prices: dict) -> openp
             c.number_format = u'₹#,##0.00'
             c.alignment = right_align()
 
-    # Tax rate note
     row += 2
     ws2.merge_cells(start_row=row, start_column=2, end_row=row, end_column=7)
     note = ws2.cell(row=row, column=2,
@@ -811,7 +1202,6 @@ def _tax_excel(client_name: str, holdings, realized_rows, prices: dict) -> openp
                 c.font = cell_font()
         row3 += 1
 
-    # Total row
     ws3.row_dimensions[row3].height = 20
     tot_vals = ["", "TOTAL", "", "", "", "", total_invested, total_current or "—",
                 total_unrealized or "—", ""]
@@ -821,6 +1211,63 @@ def _tax_excel(client_name: str, holdings, realized_rows, prices: dict) -> openp
         if col in (8, 9, 10) and isinstance(val, (int, float)):
             c.number_format = u'₹#,##0.00'
             c.alignment = right_align()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SHEET 4 – F&O Trades (if derivative data available)
+    # ══════════════════════════════════════════════════════════════════════════
+    if deriv_summary and deriv_summary.get("by_month"):
+        ws4 = wb.create_sheet("F&O Summary")
+        ws4.column_dimensions["A"].width = 2
+        ws4.column_dimensions["B"].width = 14
+        ws4.column_dimensions["C"].width = 18
+        ws4.column_dimensions["D"].width = 18
+        ws4.column_dimensions["E"].width = 18
+        ws4.column_dimensions["F"].width = 10
+
+        ws4.row_dimensions[2].height = 26
+        ws4.merge_cells("B2:F2")
+        t4 = ws4["B2"]
+        t4.value = f"F&O Monthly P&L Summary — FY {FY}"
+        t4.font, t4.fill, t4.alignment, t4.border = hdr_font(sz=12), fill(NAVY), center(), thin_border()
+
+        ws4.row_dimensions[3].height = 20
+        for col, hdr in enumerate(["Month", "Gross Profit (₹)", "Gross Loss (₹)", "Net P&L (₹)", "Trades"], 2):
+            c = ws4.cell(row=3, column=col, value=hdr)
+            c.font, c.fill, c.alignment, c.border = hdr_font(), fill(BLUE), center(True), thin_border()
+
+        row4 = 4
+        for idx, m in enumerate(deriv_summary["by_month"], 1):
+            bg = WHITE if idx % 2 == 0 else GRAY
+            ws4.row_dimensions[row4].height = 18
+            net_pnl = m["pnl"]
+            for col, val in enumerate([m["month"], m["profit"], m["loss"], net_pnl, m["trades"]], 2):
+                c = ws4.cell(row=row4, column=col, value=val)
+                c.border = thin_border()
+                c.fill   = fill(bg)
+                if col in (3, 4, 5) and isinstance(val, (int, float)):
+                    c.number_format = u'₹#,##0.00'
+                    c.alignment = right_align()
+                    c.font = cell_font(color=(GREEN if val >= 0 else RED) if col == 5 else BLACK)
+                else:
+                    c.font = cell_font()
+            row4 += 1
+
+        # Totals
+        ws4.row_dimensions[row4].height = 20
+        tot4 = ["TOTAL", deriv_summary["total_profit"], deriv_summary["total_loss"],
+                deriv_summary["total_pnl"], deriv_summary["total_trades"]]
+        for col, val in enumerate(tot4, 2):
+            c = ws4.cell(row=row4, column=col, value=val)
+            c.font, c.fill, c.border = hdr_font(color=WHITE), fill(NAVY), thin_border()
+            if col in (3, 4, 5) and isinstance(val, (int, float)):
+                c.number_format = u'₹#,##0.00'
+                c.alignment = right_align()
+
+        row4 += 2
+        ws4.merge_cells(start_row=row4, start_column=2, end_row=row4, end_column=6)
+        note4 = ws4.cell(row=row4, column=2,
+                         value="F&O income is taxable under Business Income (PGBP) — non-speculative. File ITR-3. Consult CA.")
+        note4.font = Font(italic=True, size=9, color="595959", name="Calibri")
 
     return wb
 
@@ -854,7 +1301,33 @@ async def download_tax_report(
     except Exception:
         prices = {}
 
-    wb = _tax_excel(client_name, holdings, realized_rows, prices)
+    # Derivative summary for F&O sheet
+    deriv_res = await db.execute(
+        select(DerivativeTrade).where(DerivativeTrade.portfolio_id == portfolio_id)
+    )
+    deriv_trades = deriv_res.scalars().all()
+    deriv_summary = None
+    if deriv_trades:
+        monthly: dict = defaultdict(lambda: {"pnl": 0.0, "profit": 0.0, "loss": 0.0, "trades": 0})
+        for t in deriv_trades:
+            key = t.trade_date.strftime("%Y-%m") if t.trade_date else "Unknown"
+            monthly[key]["pnl"]    += float(t.booked_pnl)
+            monthly[key]["profit"] += float(t.booked_profit)
+            monthly[key]["loss"]   += float(t.booked_loss)
+            monthly[key]["trades"] += 1
+        deriv_summary = {
+            "total_pnl":    round(sum(float(t.booked_pnl)    for t in deriv_trades), 2),
+            "total_profit": round(sum(float(t.booked_profit) for t in deriv_trades), 2),
+            "total_loss":   round(sum(float(t.booked_loss)   for t in deriv_trades), 2),
+            "total_trades": len(deriv_trades),
+            "by_month": [
+                {"month": k, "pnl": round(v["pnl"], 2), "profit": round(v["profit"], 2),
+                 "loss": round(v["loss"], 2), "trades": v["trades"]}
+                for k, v in sorted(monthly.items())
+            ],
+        }
+
+    wb = _tax_excel(client_name, holdings, realized_rows, prices, deriv_summary=deriv_summary)
 
     output = io.BytesIO()
     wb.save(output)

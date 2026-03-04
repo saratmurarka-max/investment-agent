@@ -92,13 +92,23 @@ export async function deleteHolding(portfolioId: number, holdingId: number) {
   return res.json();
 }
 
+export async function clearAllHoldings(portfolioId: number): Promise<{ deleted_holdings: number; deleted_pnl_rows: number }> {
+  const res = await fetch(`${BASE_URL}/portfolios/${portfolioId}/holdings`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail ?? "Failed to clear holdings");
+  }
+  return res.json();
+}
+
 export async function downloadTaxReport(portfolioId: number): Promise<void> {
   const res = await fetch(`${BASE_URL}/portfolios/${portfolioId}/tax-report`);
   if (!res.ok) throw new Error("Failed to generate tax report");
   const blob = await res.blob();
   const url  = URL.createObjectURL(blob);
   const a    = document.createElement("a");
-  // Try to get filename from Content-Disposition header
   const cd   = res.headers.get("Content-Disposition") ?? "";
   const match = cd.match(/filename=([^;]+)/);
   a.download = match ? match[1] : "TaxReport_FY2025-26.xlsx";
@@ -119,6 +129,39 @@ export async function uploadHoldingsExcel(portfolioId: number, file: File) {
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.detail ?? "Upload failed");
+  }
+  return res.json();
+}
+
+// ── Derivatives ──────────────────────────────────────────────────────────────
+
+export async function uploadDerivativesExcel(portfolioId: number, file: File) {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch(`${BASE_URL}/portfolios/${portfolioId}/derivatives/upload`, {
+    method: "POST",
+    body: form,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail ?? "Upload failed");
+  }
+  return res.json();
+}
+
+export async function getDerivativesPnL(portfolioId: number) {
+  const res = await fetch(`${BASE_URL}/portfolios/${portfolioId}/derivatives/pnl`);
+  if (!res.ok) throw new Error("Failed to load derivatives P&L");
+  return res.json();
+}
+
+export async function clearDerivatives(portfolioId: number): Promise<{ deleted: number }> {
+  const res = await fetch(`${BASE_URL}/portfolios/${portfolioId}/derivatives`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail ?? "Failed to clear derivatives");
   }
   return res.json();
 }

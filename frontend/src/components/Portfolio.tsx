@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { getPortfolio, getPortfolioPnL, deleteHolding } from "../api/client";
 import PortfolioAnalytics from "./PortfolioAnalytics";
+import DerivativesView from "./DerivativesView";
 
 interface Holding {
   id: number;
@@ -90,6 +91,7 @@ export default function Portfolio({ portfolioId, refreshKey }: Props) {
   const [pnlLoading, setPnlLoading] = useState(false);
   const [deletingId, setDeletingId] = useState<number | null>(null);
   const [showAnalytics, setShowAnalytics] = useState(true);
+  const [showDerivatives, setShowDerivatives] = useState(false);
   const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -359,6 +361,24 @@ export default function Portfolio({ portfolioId, refreshKey }: Props) {
       {pnlLoading && !hasLivePrices && (
         <p className="text-xs text-gray-400 text-center animate-pulse">Fetching live prices...</p>
       )}
+
+      {/* F&O / Derivatives Section */}
+      <div className="border-t border-gray-100">
+        <button
+          onClick={() => setShowDerivatives((v) => !v)}
+          className="w-full flex items-center justify-between text-xs text-gray-500 hover:text-gray-700 py-2"
+        >
+          <span className="font-semibold uppercase tracking-wide">
+            {showDerivatives ? "▲ Hide F&O / Derivatives" : "▼ Show F&O / Derivatives"}
+          </span>
+          <span className="text-purple-500 font-medium">Options &amp; Futures</span>
+        </button>
+        {showDerivatives && (
+          <div className="pt-2 pb-1">
+            <DerivativesView portfolioId={portfolioId} />
+          </div>
+        )}
+      </div>
     </div>
   );
 }

@@ -33,6 +33,7 @@ class Portfolio(Base):
     client: Mapped["Client"] = relationship(back_populates="portfolios")
     holdings: Mapped[list["Holding"]] = relationship(back_populates="portfolio", cascade="all, delete-orphan")
     realized_pnls: Mapped[list["RealizedPnL"]] = relationship(back_populates="portfolio", cascade="all, delete-orphan")
+    derivative_trades: Mapped[list["DerivativeTrade"]] = relationship(back_populates="portfolio", cascade="all, delete-orphan")
 
 
 class Holding(Base):
@@ -60,3 +61,30 @@ class RealizedPnL(Base):
     long_term_gain: Mapped[Decimal] = mapped_column(Numeric(18, 4))   # LTCG
 
     portfolio: Mapped["Portfolio"] = relationship(back_populates="realized_pnls")
+
+
+class DerivativeTrade(Base):
+    """Stores F&O trades from broker derivative P&L uploads (PROFITMART DER P&L format)."""
+    __tablename__ = "derivative_trades"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    portfolio_id: Mapped[int] = mapped_column(ForeignKey("portfolios.id"), index=True)
+    scrip_symbol: Mapped[str] = mapped_column(String(150))
+    instrument_type: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)   # OP, FU
+    option_type: Mapped[Optional[str]] = mapped_column(String(5), nullable=True)         # CE, PE
+    underlying: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)         # NIFTY
+    expiry_date: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    strike_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2), nullable=True)
+    trade_date: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    buy_qty: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    buy_rate: Mapped[Decimal] = mapped_column(Numeric(14, 4))
+    buy_amount: Mapped[Decimal] = mapped_column(Numeric(16, 4))
+    sell_date: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    sell_qty: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    sell_rate: Mapped[Decimal] = mapped_column(Numeric(14, 4))
+    sell_amount: Mapped[Decimal] = mapped_column(Numeric(16, 4))
+    booked_pnl: Mapped[Decimal] = mapped_column(Numeric(16, 4))
+    booked_profit: Mapped[Decimal] = mapped_column(Numeric(16, 4))
+    booked_loss: Mapped[Decimal] = mapped_column(Numeric(16, 4))
+
+    portfolio: Mapped["Portfolio"] = relationship(back_populates="derivative_trades")
