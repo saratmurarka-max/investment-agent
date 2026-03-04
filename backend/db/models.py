@@ -1,5 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
+from typing import Optional
 
 from sqlalchemy import DateTime, ForeignKey, Numeric, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -40,6 +41,7 @@ class Holding(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     portfolio_id: Mapped[int] = mapped_column(ForeignKey("portfolios.id"), index=True)
     ticker: Mapped[str] = mapped_column(String(20))
+    name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     shares: Mapped[Decimal] = mapped_column(Numeric(18, 6))
     avg_cost: Mapped[Decimal] = mapped_column(Numeric(18, 4))  # average cost per share
     purchased_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

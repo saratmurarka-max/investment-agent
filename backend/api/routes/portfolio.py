@@ -47,15 +47,16 @@ def _to_exchange_ticker(symbol: str) -> str:
     Resolve a raw broker symbol to a yfinance-compatible ticker.
     Defaults to .NS (NSE) — the primary exchange for most Indian stocks.
     Symbols already carrying .NS / .BO are returned unchanged.
-    Numeric BSE codes (e.g. 500285-EQ) are left as-is.
+    Numeric BSE codes (e.g. 531637-EQ) are converted to BSE format (531637.BO).
     """
     symbol = symbol.strip().upper()
     # Already qualified
     if symbol.endswith(".NS") or symbol.endswith(".BO"):
         return symbol
-    # Numeric BSE code — leave as-is (yfinance won't know it, but we keep the data)
+    # Numeric BSE code (e.g. 531637-EQ or 531637) → use BSE format for yfinance
     if re.match(r"^\d+(-EQ)?$", symbol):
-        return symbol
+        base = re.sub(r"-EQ$", "", symbol)
+        return base + ".BO"
     # Default to NSE (primary Indian exchange)
     return symbol + ".NS"
 
@@ -64,7 +65,8 @@ def _is_broker_format(rows: list) -> bool:
     if len(rows) < 4:
         return False
     headers = _normalise_headers(rows[3])
-    return "scrip_name" in headers and "purchase_qty" in headers
+    has_symbol = "scrip_symbol" in headers or "scrip_name" in headers
+    return has_symbol and "purchase_qty" in headers
 
 
 def _parse_broker_format(rows: list) -> tuple[list[dict], list[dict], list[str]]:
@@ -85,17 +87,22 @@ def _parse_broker_format(rows: list) -> tuple[list[dict], list[dict], list[str]]
                 return headers.index(n)
         return -1
 
-    sym_idx       = col(["scrip_name"])           # NSE ticker name (e.g. RELIANCE, TCS)
+    sym_idx       = col(["scrip_symbol"])          # NSE/BSE ticker symbol (e.g. RELIANCE, BANKBARODA)
+    name_idx      = col(["scrip_name"])            # Company display name (e.g. Reliance Industries Ltd.)
     qty_idx       = col(["purchase_qty"])
     rate_idx      = col(["purchase_rate"])
     sell_qty_idx  = col(["sell_qty"])
     stcg_idx      = col(["shorterm_pl", "short_term_pl", "shorterm_p\\l"])
     ltcg_idx      = col(["actual_longterm", "longterm_pl", "actual_longterm_pl"])
 
+    # If no scrip_symbol column, fall back to scrip_name as ticker
+    if sym_idx == -1:
+        sym_idx = name_idx
+
     if any(i == -1 for i in [sym_idx, qty_idx, rate_idx]):
         return [], [], ["Could not find required broker columns"]
 
-    open_agg: dict[str, dict] = defaultdict(lambda: {"net_qty": 0.0, "cost_basis": 0.0})
+    open_agg: dict[str, dict] = defaultdict(lambda: {"net_qty": 0.0, "cost_basis": 0.0, "name": ""})
     real_agg: dict[str, dict] = defaultdict(lambda: {"short_term": 0.0, "long_term": 0.0})
     skipped: list[str] = []
 
@@ -104,6 +111,8 @@ def _parse_broker_format(rows: list) -> tuple[list[dict], list[dict], list[str]]
             symbol = str(row[sym_idx] or "").strip().upper()
             if not symbol or symbol == "NONE":
                 continue
+
+            display_name = str(row[name_idx] or "").strip() if name_idx >= 0 else ""
 
             buy_qty  = float(row[qty_idx]  or 0)
             buy_rate = float(row[rate_idx] or 0)
@@ -124,6 +133,8 @@ def _parse_broker_format(rows: list) -> tuple[list[dict], list[dict], list[str]]
             if net_qty > 0:
                 open_agg[symbol]["net_qty"]    += net_qty
                 open_agg[symbol]["cost_basis"] += net_qty * buy_rate
+                if display_name and not open_agg[symbol]["name"]:
+                    open_agg[symbol]["name"] = display_name
 
         except Exception:
             skipped.append(f"row {i}")
@@ -131,6 +142,7 @@ def _parse_broker_format(rows: list) -> tuple[list[dict], list[dict], list[str]]
     holdings = [
         {
             "ticker":   _to_exchange_ticker(sym),
+            "name":     data["name"] or None,
             "shares":   round(data["net_qty"], 6),
             "avg_cost": round(data["cost_basis"] / data["net_qty"], 4),
         }
@@ -214,6 +226,7 @@ async def get_portfolio(portfolio_id: int, db: AsyncSession = Depends(get_db)):
             {
                 "id": h.id,
                 "ticker": h.ticker,
+                "name": h.name,
                 "shares": float(h.shares),
                 "avg_cost": float(h.avg_cost),
             }
@@ -276,6 +289,7 @@ async def get_portfolio_pnl(portfolio_id: int, db: AsyncSession = Depends(get_db
         holding_pnl.append({
             "id":              h.id,
             "ticker":          h.ticker,
+            "name":            h.name,
             "shares":          shares,
             "avg_cost":        avg_cost,
             "current_price":   price,
@@ -334,6 +348,7 @@ async def add_holding(
     return {
         "id": holding.id,
         "ticker": holding.ticker,
+        "name": holding.name,
         "shares": float(holding.shares),
         "avg_cost": float(holding.avg_cost),
     }
@@ -436,6 +451,7 @@ async def upload_holdings_excel(
         db.add(Holding(
             portfolio_id=portfolio_id,
             ticker=h["ticker"],
+            name=h.get("name"),
             shares=h["shares"],
             avg_cost=h["avg_cost"],
         ))

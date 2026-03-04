@@ -4,6 +4,7 @@ import { getPortfolio, getPortfolioPnL, deleteHolding } from "../api/client";
 interface Holding {
   id: number;
   ticker: string;
+  name?: string;
   shares: number;
   avg_cost: number;
   current_price?: number;
@@ -244,7 +245,13 @@ export default function Portfolio({ portfolioId, refreshKey }: Props) {
           <tbody>
             {data.holdings.map((h) => (
               <tr key={h.id} className="border-b border-gray-50 hover:bg-gray-50">
-                <td className="py-2 font-mono font-medium text-blue-700 text-xs">{displayTicker(h.ticker)}</td>
+                <td className="py-2 font-medium text-blue-700 text-xs">
+                  {h.name ? (
+                    <span title={displayTicker(h.ticker)}>{h.name}</span>
+                  ) : (
+                    <span className="font-mono">{displayTicker(h.ticker)}</span>
+                  )}
+                </td>
                 <td className="py-2 text-right text-gray-600 text-xs">{h.shares.toFixed(2)}</td>
                 <td className="py-2 text-right text-gray-600 text-xs">{fmt(h.avg_cost)}</td>
                 {hasLivePrices && (
