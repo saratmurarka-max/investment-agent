@@ -132,6 +132,19 @@ async def add_holding(
     }
 
 
+@router.delete("/{portfolio_id}/holdings/{holding_id}")
+async def delete_holding(
+    portfolio_id: int, holding_id: int, db: AsyncSession = Depends(get_db)
+):
+    """Delete a single holding by ID."""
+    holding = await db.get(Holding, holding_id)
+    if not holding or holding.portfolio_id != portfolio_id:
+        raise HTTPException(404, "Holding not found")
+    await db.delete(holding)
+    await db.commit()
+    return {"deleted": holding_id}
+
+
 @router.post("/{portfolio_id}/holdings/upload")
 async def upload_holdings_excel(
     portfolio_id: int,

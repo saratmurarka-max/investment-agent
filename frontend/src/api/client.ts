@@ -74,6 +74,18 @@ export async function addHolding(
   return res.json();
 }
 
+export async function deleteHolding(portfolioId: number, holdingId: number) {
+  const res = await fetch(
+    `${BASE_URL}/portfolios/${portfolioId}/holdings/${holdingId}`,
+    { method: "DELETE" }
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail ?? "Failed to delete holding");
+  }
+  return res.json();
+}
+
 export async function uploadHoldingsExcel(portfolioId: number, file: File) {
   const form = new FormData();
   form.append("file", file);
