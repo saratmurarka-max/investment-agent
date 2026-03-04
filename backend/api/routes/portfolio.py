@@ -266,8 +266,9 @@ async def get_portfolio_pnl(portfolio_id: int, db: AsyncSession = Depends(get_db
 
     # Fetch live prices for all tickers
     tickers = [h.ticker for h in holdings]
+    names = {h.ticker: h.name for h in holdings if h.name}
     try:
-        current_prices = await market_data.get_current_prices(tickers)
+        current_prices = await market_data.get_current_prices(tickers, names=names)
     except Exception:
         current_prices = {}
 
