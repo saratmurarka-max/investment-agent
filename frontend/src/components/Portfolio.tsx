@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getPortfolio, deleteHolding } from "../api/client";
 
 interface Holding {
@@ -20,17 +20,48 @@ interface Props {
   refreshKey?: number;
 }
 
+const MAX_RETRIES = 8;
+const RETRY_DELAY_MS = 4000;
+
 export default function Portfolio({ portfolioId, refreshKey }: Props) {
   const [data, setData] = useState<PortfolioData | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [retryCount, setRetryCount] = useState(0);
   const [deletingId, setDeletingId] = useState<number | null>(null);
+  const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
+    if (retryTimer.current) clearTimeout(retryTimer.current);
     setError(null);
-    getPortfolio(portfolioId)
-      .then(setData)
-      .catch((e) => setError(e.message));
+    setRetryCount(0);
+    load(0);
+
+    return () => {
+      if (retryTimer.current) clearTimeout(retryTimer.current);
+    };
   }, [portfolioId, refreshKey]);
+
+  function load(attempt: number) {
+    getPortfolio(portfolioId)
+      .then((d) => {
+        setData(d);
+        setError(null);
+      })
+      .catch((e) => {
+        if (attempt < MAX_RETRIES) {
+          setRetryCount(attempt + 1);
+          retryTimer.current = setTimeout(() => load(attempt + 1), RETRY_DELAY_MS);
+        } else {
+          setError(e.message ?? "Failed to load portfolio");
+        }
+      });
+  }
+
+  function manualRetry() {
+    setError(null);
+    setRetryCount(0);
+    load(0);
+  }
 
   async function handleDelete(holding: Holding) {
     if (!confirm(`Delete ${holding.ticker} from portfolio?`)) return;
@@ -49,8 +80,34 @@ export default function Portfolio({ portfolioId, refreshKey }: Props) {
     }
   }
 
-  if (error) return <p className="text-red-500 text-sm">{error}</p>;
-  if (!data) return <p className="text-sm text-gray-400 animate-pulse">Loading holdings...</p>;
+  if (error) {
+    return (
+      <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5 text-center">
+        <p className="text-red-500 text-sm mb-3">{error}</p>
+        <button
+          onClick={manualRetry}
+          className="text-xs bg-blue-600 text-white px-4 py-1.5 rounded-lg hover:bg-blue-700"
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
+
+  if (!data) {
+    return (
+      <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5 text-center">
+        <p className="text-sm text-gray-400 animate-pulse">
+          {retryCount === 0
+            ? "Loading holdings..."
+            : `Connecting to server... (${retryCount}/${MAX_RETRIES})`}
+        </p>
+        {retryCount > 0 && (
+          <p className="text-xs text-gray-300 mt-1">Server is waking up, please wait</p>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5">
@@ -70,13 +127,12 @@ export default function Portfolio({ portfolioId, refreshKey }: Props) {
               <tr key={h.id} className="border-b border-gray-50 hover:bg-gray-50">
                 <td className="py-2.5 font-mono font-medium text-blue-700">{h.ticker}</td>
                 <td className="py-2.5 text-right text-gray-600">{h.shares.toFixed(4)}</td>
-                <td className="py-2.5 text-right text-gray-600">${h.avg_cost.toFixed(2)}</td>
+                <td className="py-2.5 text-right text-gray-600">₹{h.avg_cost.toFixed(2)}</td>
                 <td className="py-2.5 text-right">
                   <button
                     onClick={() => handleDelete(h)}
                     disabled={deletingId === h.id}
                     className="text-red-400 hover:text-red-600 disabled:opacity-40 transition-colors text-xs px-2 py-1 rounded hover:bg-red-50"
-                    title="Delete holding"
                   >
                     {deletingId === h.id ? "..." : "Delete"}
                   </button>
