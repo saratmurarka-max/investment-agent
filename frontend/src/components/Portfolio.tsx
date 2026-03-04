@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { getPortfolio, getPortfolioPnL, deleteHolding } from "../api/client";
+import PortfolioAnalytics from "./PortfolioAnalytics";
 
 interface Holding {
   id: number;
@@ -88,6 +89,7 @@ export default function Portfolio({ portfolioId, refreshKey }: Props) {
   const [retryCount, setRetryCount] = useState(0);
   const [pnlLoading, setPnlLoading] = useState(false);
   const [deletingId, setDeletingId] = useState<number | null>(null);
+  const [showAnalytics, setShowAnalytics] = useState(true);
   const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -252,8 +254,27 @@ export default function Portfolio({ portfolioId, refreshKey }: Props) {
         </>
       )}
 
+      {/* Analytics Panel */}
+      {summary && data.holdings.some((h) => h.current_price != null) && (
+        <div>
+          <button
+            onClick={() => setShowAnalytics((v) => !v)}
+            className="w-full flex items-center justify-between text-xs text-gray-500 hover:text-gray-700 py-2 border-t border-gray-100"
+          >
+            <span className="font-semibold uppercase tracking-wide">
+              {showAnalytics ? "▲ Hide Analytics" : "▼ Show Analytics"}
+            </span>
+          </button>
+          {showAnalytics && (
+            <div className="pt-2">
+              <PortfolioAnalytics holdings={data.holdings} summary={summary} />
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Holdings Table */}
-      <div className="overflow-x-auto">
+      <div className="overflow-x-auto border-t border-gray-100 pt-2">
         <table className="w-full text-sm">
           <thead>
             <tr className="text-left text-gray-400 border-b border-gray-100 text-xs">
