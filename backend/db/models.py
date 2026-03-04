@@ -38,7 +38,7 @@ class Holding(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     portfolio_id: Mapped[int] = mapped_column(ForeignKey("portfolios.id"), index=True)
-    ticker: Mapped[str] = mapped_column(String(10))
+    ticker: Mapped[str] = mapped_column(String(20))
     shares: Mapped[Decimal] = mapped_column(Numeric(18, 6))
     avg_cost: Mapped[Decimal] = mapped_column(Numeric(18, 4))  # average cost per share
     purchased_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
