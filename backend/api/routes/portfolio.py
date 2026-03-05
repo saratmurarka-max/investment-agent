@@ -663,11 +663,74 @@ async def delete_holding(
     return {"deleted": holding_id}
 
 
+def _read_html_xls_rows(contents: bytes) -> list[tuple]:
+    """
+    Parse an HTML-disguised XLS file (common from PROFITMART and other Indian brokers).
+    These files carry a .xls extension but are actually HTML <table> documents.
+    Handles colspan expansion so the returned row structure matches what xlrd
+    would produce for a real binary XLS file.
+    """
+    from html.parser import HTMLParser
+
+    class _TableParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.rows: list[list] = []
+            self._row: list | None = None
+            self._cell_text: str | None = None
+            self._colspan: int = 1
+
+        def handle_starttag(self, tag, attrs):
+            attrs_d = dict(attrs)
+            if tag == "tr":
+                self._row = []
+            elif tag in ("th", "td") and self._row is not None:
+                self._cell_text = ""
+                self._colspan = int(attrs_d.get("colspan", 1))
+
+        def handle_endtag(self, tag):
+            if tag == "tr" and self._row is not None:
+                self.rows.append(self._row)
+                self._row = None
+            elif tag in ("th", "td") and self._row is not None and self._cell_text is not None:
+                text = self._cell_text.strip()
+                val: object = None
+                if text:
+                    try:
+                        val = float(text)
+                    except ValueError:
+                        val = text
+                self._row.append(val)
+                for _ in range(self._colspan - 1):
+                    self._row.append(None)
+                self._cell_text = None
+                self._colspan = 1
+
+        def handle_data(self, data):
+            if self._cell_text is not None:
+                self._cell_text += data
+
+    parser = _TableParser()
+    try:
+        text = contents.decode("utf-8", errors="replace")
+    except Exception:
+        text = contents.decode("latin-1", errors="replace")
+    parser.feed(text)
+    return [tuple(r) for r in parser.rows if r]
+
+
 def _read_excel_rows(contents: bytes, filename: str) -> list[tuple]:
     """
     Read all rows from an Excel file, returning a list of value tuples.
-    Supports both .xlsx (via openpyxl) and .xls (via xlrd).
+    Supports:
+      - .xlsx via openpyxl
+      - .xls BIFF binary format via xlrd
+      - HTML-disguised .xls files (common from PROFITMART and other Indian brokers)
     """
+    # Detect HTML-disguised XLS: file content starts with '<' (an HTML tag)
+    if contents.lstrip()[:1] == b'<':
+        return _read_html_xls_rows(contents)
+
     fname = (filename or "").lower()
     if fname.endswith(".xls") and not fname.endswith(".xlsx"):
         import xlrd
