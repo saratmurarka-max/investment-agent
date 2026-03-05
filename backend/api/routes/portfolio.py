@@ -662,6 +662,35 @@ async def delete_holding(
     return {"deleted": holding_id}
 
 
+def _read_excel_rows(contents: bytes, filename: str) -> list[tuple]:
+    """
+    Read all rows from an Excel file, returning a list of value tuples.
+    Supports both .xlsx (via openpyxl) and .xls (via xlrd).
+    """
+    fname = (filename or "").lower()
+    if fname.endswith(".xls") and not fname.endswith(".xlsx"):
+        import xlrd
+        wb = xlrd.open_workbook(file_contents=contents)
+        ws = wb.sheet_by_index(0)
+        rows: list[tuple] = []
+        for r in range(ws.nrows):
+            row = []
+            for c in range(ws.ncols):
+                cell = ws.cell(r, c)
+                if cell.ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK):
+                    row.append(None)
+                elif cell.ctype == xlrd.XL_CELL_DATE:
+                    row.append(xlrd.xldate_as_datetime(cell.value, wb.datemode))
+                else:
+                    row.append(cell.value)
+            rows.append(tuple(row))
+        return rows
+    else:
+        wb = openpyxl.load_workbook(io.BytesIO(contents), read_only=True, data_only=True)
+        ws = wb.active
+        return list(ws.iter_rows(values_only=True))
+
+
 @router.post("/{portfolio_id}/holdings/upload")
 async def upload_holdings_excel(
     portfolio_id: int,
@@ -678,8 +707,8 @@ async def upload_holdings_excel(
     2. SIMPLE FORMAT:
        - Row 1: Ticker | Shares | Avg Cost
     """
-    if not file.filename or not file.filename.endswith(".xlsx"):
-        raise HTTPException(400, "Only .xlsx files are supported")
+    if not file.filename or not file.filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(400, "Only .xlsx and .xls files are supported")
 
     portfolio = await db.get(Portfolio, portfolio_id)
     if not portfolio:
@@ -687,11 +716,9 @@ async def upload_holdings_excel(
 
     contents = await file.read()
     try:
-        wb = openpyxl.load_workbook(io.BytesIO(contents), read_only=True, data_only=True)
-        ws = wb.active
-        rows = list(ws.iter_rows(values_only=True))
+        rows = _read_excel_rows(contents, file.filename)
     except Exception:
-        raise HTTPException(400, "Could not read Excel file. Make sure it is a valid .xlsx file.")
+        raise HTTPException(400, "Could not read Excel file. Make sure it is a valid .xlsx or .xls file.")
 
     if len(rows) < 2:
         raise HTTPException(400, "File must have a header row and at least one data row.")
@@ -821,8 +848,8 @@ async def upload_derivatives_excel(
     Upload a PROFITMART Derivative P&L Excel (DER P&L report).
     Replaces all existing derivative trades for this portfolio.
     """
-    if not file.filename or not file.filename.endswith(".xlsx"):
-        raise HTTPException(400, "Only .xlsx files are supported")
+    if not file.filename or not file.filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(400, "Only .xlsx and .xls files are supported")
 
     portfolio = await db.get(Portfolio, portfolio_id)
     if not portfolio:
@@ -830,9 +857,7 @@ async def upload_derivatives_excel(
 
     contents = await file.read()
     try:
-        wb = openpyxl.load_workbook(io.BytesIO(contents), read_only=True, data_only=True)
-        ws = wb.active
-        rows = list(ws.iter_rows(values_only=True))
+        rows = _read_excel_rows(contents, file.filename)
     except Exception:
         raise HTTPException(400, "Could not read Excel file.")
 

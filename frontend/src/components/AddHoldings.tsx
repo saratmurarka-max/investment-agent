@@ -51,8 +51,8 @@ export default function AddHoldings({ portfolioId, onAdded }: Props) {
   async function handleEquityFile(file: File) {
     setUploadError(null);
     setUploadResult(null);
-    if (!file.name.endsWith(".xlsx")) {
-      setUploadError("Only .xlsx files are supported.");
+    if (!file.name.endsWith(".xlsx") && !file.name.endsWith(".xls")) {
+      setUploadError("Only .xlsx and .xls files are supported.");
       return;
     }
     setUploadLoading(true);
@@ -79,8 +79,8 @@ export default function AddHoldings({ portfolioId, onAdded }: Props) {
   async function handleDerivFile(file: File) {
     setDerivError(null);
     setDerivResult(null);
-    if (!file.name.endsWith(".xlsx")) {
-      setDerivError("Only .xlsx files are supported.");
+    if (!file.name.endsWith(".xlsx") && !file.name.endsWith(".xls")) {
+      setDerivError("Only .xlsx and .xls files are supported.");
       return;
     }
     setDerivLoading(true);
@@ -170,9 +170,9 @@ export default function AddHoldings({ portfolioId, onAdded }: Props) {
             <p className="text-sm font-medium text-gray-700">
               {uploadLoading ? "Uploading..." : "Drop your Equity Excel file here"}
             </p>
-            <p className="text-xs text-gray-400 mt-1">or click to browse — .xlsx only</p>
+            <p className="text-xs text-gray-400 mt-1">or click to browse — .xlsx / .xls</p>
             <input
-              ref={fileInputRef} type="file" accept=".xlsx" className="hidden"
+              ref={fileInputRef} type="file" accept=".xlsx,.xls" className="hidden"
               onChange={(e) => e.target.files?.[0] && handleEquityFile(e.target.files[0])}
             />
           </div>
@@ -228,9 +228,9 @@ export default function AddHoldings({ portfolioId, onAdded }: Props) {
             <p className="text-sm font-medium text-gray-700">
               {derivLoading ? "Uploading..." : "Drop your Derivatives P&L Excel here"}
             </p>
-            <p className="text-xs text-gray-400 mt-1">PROFITMART DER P&L format — .xlsx only</p>
+            <p className="text-xs text-gray-400 mt-1">PROFITMART DER P&L format — .xlsx / .xls</p>
             <input
-              ref={derivFileRef} type="file" accept=".xlsx" className="hidden"
+              ref={derivFileRef} type="file" accept=".xlsx,.xls" className="hidden"
               onChange={(e) => e.target.files?.[0] && handleDerivFile(e.target.files[0])}
             />
           </div>
