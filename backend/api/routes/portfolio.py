@@ -1023,6 +1023,18 @@ def _tax_excel(
     """
     wb = openpyxl.Workbook()
 
+    def _add_logo(target_ws) -> None:
+        """Stamp the PROFITMART logo at B1 of any sheet (each call needs a fresh Image object)."""
+        try:
+            logo_img = XLImage(io.BytesIO(_PROFITMART_LOGO_BYTES))
+            logo_img.width  = 150
+            logo_img.height = 30
+            logo_img.anchor = "B1"
+            target_ws.add_image(logo_img)
+            target_ws.row_dimensions[1].height = 38
+        except Exception:
+            pass
+
     # ── Colour / font helpers ──────────────────────────────────────────────────
     NAVY   = "1B3A6B"
     BLUE   = "2E6DB4"
@@ -1104,16 +1116,7 @@ def _tax_excel(
     ws.column_dimensions["C"].width = 22
     ws.row_dimensions[1].height = 8
 
-    # Logo (top-left of sheet) — embedded from _PROFITMART_LOGO_BYTES
-    try:
-        img = XLImage(io.BytesIO(_PROFITMART_LOGO_BYTES))
-        img.width  = 150
-        img.height = 30
-        img.anchor = "B1"
-        ws.add_image(img)
-        ws.row_dimensions[1].height = 38
-    except Exception:
-        pass
+    _add_logo(ws)   # Sheet 1 logo
 
     # Title banner
     ws.row_dimensions[2].height = 30
@@ -1260,6 +1263,7 @@ def _tax_excel(
     COL_WIDTHS2 = [2, 32, 16, 18, 18, 20, 20]
     for i, w in enumerate(COL_WIDTHS2, 1):
         ws2.column_dimensions[get_column_letter(i)].width = w
+    _add_logo(ws2)  # Sheet 2 logo
 
     ws2.row_dimensions[2].height = 26
     ws2.merge_cells("B2:G2")
@@ -1322,6 +1326,7 @@ def _tax_excel(
     COL_WIDTHS3 = [2, 32, 14, 10, 16, 16, 18, 18, 14]
     for i, w in enumerate(COL_WIDTHS3, 1):
         ws3.column_dimensions[get_column_letter(i)].width = w
+    _add_logo(ws3)  # Sheet 3 logo
 
     ws3.row_dimensions[2].height = 26
     ws3.merge_cells("B2:J2")
@@ -1391,6 +1396,7 @@ def _tax_excel(
         ws4.column_dimensions["D"].width = 18
         ws4.column_dimensions["E"].width = 18
         ws4.column_dimensions["F"].width = 10
+        _add_logo(ws4)  # Sheet 4 logo
 
         ws4.row_dimensions[2].height = 26
         ws4.merge_cells("B2:F2")
