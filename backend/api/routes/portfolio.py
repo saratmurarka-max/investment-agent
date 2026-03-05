@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import io
 import re
@@ -1032,19 +1033,68 @@ async def clear_derivatives(portfolio_id: int, db: AsyncSession = Depends(get_db
 
 # ── Tax Report ─────────────────────────────────────────────────────────────────
 
+def _get_fy_dividends(holdings) -> list[dict]:
+    """
+    Fetch FY 2025-26 dividend events for each open holding using yfinance.
+    Returns rows sorted by (ticker, ex_date):
+        [{ticker, display, ticker_clean, ex_date, dps, shares, total}, ...]
+
+    NOTE: Uses current open-position share count as proxy for shares held on
+    ex-dividend date (individual buy/sell dates are not stored per-transaction).
+    """
+    import yfinance as yf
+    import pandas as pd
+
+    fy_start = pd.Timestamp("2025-04-01")
+    fy_end   = pd.Timestamp("2026-03-31")
+    rows: list[dict] = []
+
+    for h in holdings:
+        try:
+            divs = yf.Ticker(h.ticker).dividends
+            if divs is None or divs.empty:
+                continue
+            # Strip timezone so comparison with tz-naive Timestamps works
+            if divs.index.tz is not None:
+                divs.index = divs.index.tz_convert("UTC").tz_localize(None)
+            fy_divs = divs[(divs.index >= fy_start) & (divs.index <= fy_end)]
+            if fy_divs.empty:
+                continue
+            shares       = float(h.shares)
+            display      = h.name or h.ticker.replace(".NS", "").replace(".BO", "")
+            ticker_clean = h.ticker.replace(".NS", "").replace(".BO", "")
+            for ex_dt, dps in fy_divs.items():
+                dps_val = round(float(dps), 4)
+                rows.append({
+                    "ticker":       h.ticker,
+                    "display":      display,
+                    "ticker_clean": ticker_clean,
+                    "ex_date":      ex_dt.date(),
+                    "dps":          dps_val,
+                    "shares":       shares,
+                    "total":        round(dps_val * shares, 2),
+                })
+        except Exception:
+            pass
+
+    return sorted(rows, key=lambda r: (r["ticker"], str(r["ex_date"])))
+
+
 def _tax_excel(
     client_name: str,
     holdings,
     realized_rows,
     prices: dict,
     deriv_summary: dict | None = None,
+    dividend_rows: list | None = None,
 ) -> openpyxl.Workbook:
     """
     Generate a tax filing workbook with sheets:
-      1. Tax Summary        – AY, STCG/LTCG totals, F&O, estimated tax liability
+      1. Tax Summary        – AY, STCG/LTCG totals, F&O, dividend, estimated tax
       2. Realized Gains     – Per-stock STCG and LTCG breakdown
       3. Open Positions     – Unrealized P&L on current holdings
       4. F&O Trades         – Monthly derivative P&L (if deriv_summary provided)
+      5. Dividend Income    – Per-stock, per-ex-date dividend detail (if dividend_rows provided)
     """
     wb = openpyxl.Workbook()
 
@@ -1267,6 +1317,44 @@ def _tax_excel(
         note4.alignment = Alignment(wrap_text=True, vertical="center")
         next_row += 1
 
+    # ── Section E: Dividend Income ─────────────────────────────────────────────
+    if dividend_rows:
+        total_div_e = sum(r["total"] for r in dividend_rows)
+
+        ws.row_dimensions[next_row].height = 10  # spacer
+        next_row += 1
+
+        ws.row_dimensions[next_row].height = 20
+        ws.merge_cells(f"B{next_row}:C{next_row}")
+        sh_e = ws[f"B{next_row}"]
+        sh_e.value = "Section E — Dividend Income (FY 2025-26)"
+        sh_e.font, sh_e.fill, sh_e.alignment, sh_e.border = (
+            hdr_font(), fill(BLUE), center(), thin_border()
+        )
+        next_row += 1
+
+        div_summary_rows_e = [
+            ("Total Dividend Income Received",           total_div_e),
+            ("Indicative TDS @ 10% (if >₹5,000/co.)",   round(total_div_e * 0.10, 2)),
+        ]
+        for lbl_text, val in div_summary_rows_e:
+            ws.row_dimensions[next_row].height = 18
+            label(ws, next_row, 2, lbl_text, bg=GRAY)
+            inr(ws, next_row, 3, val, color=GREEN if val >= 0 else RED)
+            next_row += 1
+
+        ws.row_dimensions[next_row].height = 24
+        ws.merge_cells(f"B{next_row}:C{next_row}")
+        note_e = ws[f"B{next_row}"]
+        note_e.value = (
+            "ℹ  Post Finance Act 2020, dividends are fully taxable at slab rates. "
+            "TDS @ 10% is deducted when total dividend from one company exceeds ₹5,000 in a FY. "
+            "See Sheet 5 for stock-wise detail."
+        )
+        note_e.font = Font(italic=True, color=ORANGE, size=9, name="Calibri")
+        note_e.alignment = Alignment(wrap_text=True, vertical="center")
+        next_row += 1
+
     # Disclaimer
     ws.row_dimensions[next_row].height = 10    # spacer
     next_row += 1
@@ -1468,6 +1556,90 @@ def _tax_excel(
                          value="F&O income is taxable under Business Income (PGBP) — non-speculative. File ITR-3. Consult CA.")
         note4.font = Font(italic=True, size=9, color="595959", name="Calibri")
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # SHEET 5 – Dividend Income (per stock, per ex-date)
+    # ══════════════════════════════════════════════════════════════════════════
+    if dividend_rows:
+        ws5 = wb.create_sheet("Dividend Income")
+        # Col widths: A(spacer), B(#), C(Stock Name), D(Ticker), E(Ex-Date),
+        #             F(Shares), G(Div/Share), H(Total Div)
+        COL_WIDTHS5 = [2, 4, 32, 14, 14, 12, 16, 18]
+        for i, w in enumerate(COL_WIDTHS5, 1):
+            ws5.column_dimensions[get_column_letter(i)].width = w
+        _add_logo(ws5)  # Sheet 5 logo
+
+        ws5.row_dimensions[2].height = 26
+        ws5.merge_cells("B2:H2")
+        t5 = ws5["B2"]
+        t5.value = f"Dividend Income — FY {FY}"
+        t5.font, t5.fill, t5.alignment, t5.border = (
+            hdr_font(sz=12), fill(NAVY), center(), thin_border()
+        )
+
+        headers5 = ["#", "Stock Name", "Ticker", "Ex-Date",
+                    "Shares Held", "Div/Share (₹)", "Total Dividend (₹)"]
+        ws5.row_dimensions[3].height = 20
+        for col, hdr in enumerate(headers5, 2):
+            c = ws5.cell(row=3, column=col, value=hdr)
+            c.font, c.fill, c.alignment, c.border = (
+                hdr_font(), fill(BLUE), center(True), thin_border()
+            )
+
+        row5 = 4
+        for idx, dr in enumerate(dividend_rows, 1):
+            bg = WHITE if idx % 2 == 0 else GRAY
+            ws5.row_dimensions[row5].height = 18
+            vals5 = [
+                idx,
+                dr["display"],
+                dr["ticker_clean"],
+                str(dr["ex_date"]),
+                dr["shares"],
+                dr["dps"],
+                dr["total"],
+            ]
+            for col, val in enumerate(vals5, 2):
+                c = ws5.cell(row=row5, column=col, value=val)
+                c.border = thin_border()
+                c.fill   = fill(bg)
+                if col in (7, 8) and isinstance(val, (int, float)):
+                    c.number_format = u'₹#,##0.00'
+                    c.alignment = right_align()
+                    c.font = cell_font(color=GREEN)
+                elif col == 6 and isinstance(val, (int, float)):
+                    c.number_format = u'₹#,##0.00'
+                    c.alignment = right_align()
+                    c.font = cell_font()
+                elif col == 5 and isinstance(val, (int, float)):
+                    c.alignment = right_align()
+                    c.font = cell_font()
+                else:
+                    c.font = cell_font()
+            row5 += 1
+
+        # Totals row
+        total_div5 = sum(r["total"] for r in dividend_rows)
+        ws5.row_dimensions[row5].height = 20
+        tot5 = ["", "TOTAL", "", "", "", "", total_div5]
+        for col, val in enumerate(tot5, 2):
+            c = ws5.cell(row=row5, column=col, value=val)
+            c.font, c.fill, c.border = hdr_font(color=WHITE), fill(NAVY), thin_border()
+            if col == 8 and isinstance(val, (int, float)):
+                c.number_format = u'₹#,##0.00'
+                c.alignment = right_align()
+
+        row5 += 2
+        ws5.merge_cells(start_row=row5, start_column=2, end_row=row5, end_column=8)
+        note5 = ws5.cell(row=row5, column=2, value=(
+            "Note: Share count reflects current open positions as a proxy for shares held on "
+            "ex-dividend date. Verify actual holding with broker contract notes. "
+            "Dividend income is taxable at slab rate (post Finance Act 2020). "
+            "Dividend data sourced via yfinance / exchange feeds — verify with company announcements."
+        ))
+        note5.font = Font(italic=True, size=9, color="595959", name="Calibri")
+        note5.alignment = Alignment(wrap_text=True, vertical="center")
+        ws5.row_dimensions[row5].height = 42
+
     return wb
 
 
@@ -1527,7 +1699,17 @@ async def download_tax_report(
         }
 
 
-    wb = _tax_excel(client_name, holdings, realized_rows, prices, deriv_summary=deriv_summary)
+    # Fetch FY 2025-26 dividend data (synchronous yfinance — run in thread pool)
+    try:
+        dividend_rows = await asyncio.to_thread(_get_fy_dividends, holdings)
+    except Exception:
+        dividend_rows = []
+
+    wb = _tax_excel(
+        client_name, holdings, realized_rows, prices,
+        deriv_summary=deriv_summary,
+        dividend_rows=dividend_rows or None,
+    )
 
     output = io.BytesIO()
     wb.save(output)
