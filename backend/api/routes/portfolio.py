@@ -1,9 +1,9 @@
+import base64
 import io
 import re
 from collections import defaultdict
 from datetime import date as date_type, datetime
 
-import httpx
 import openpyxl
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -20,6 +20,87 @@ from backend.db.models import Client, Holding, Portfolio, RealizedPnL, Derivativ
 from backend.services import market_data
 
 router = APIRouter(prefix="/portfolios", tags=["portfolios"])
+
+# PROFITMART logo embedded as base64 PNG (source: profitmart.in)
+_PROFITMART_LOGO_B64 = (
+    "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"
+)
+_PROFITMART_LOGO_BYTES: bytes = base64.b64decode(_PROFITMART_LOGO_B64)
 
 
 # --- Schemas ---
@@ -932,7 +1013,6 @@ def _tax_excel(
     realized_rows,
     prices: dict,
     deriv_summary: dict | None = None,
-    logo_bytes: bytes | None = None,
 ) -> openpyxl.Workbook:
     """
     Generate a tax filing workbook with sheets:
@@ -1024,17 +1104,16 @@ def _tax_excel(
     ws.column_dimensions["C"].width = 22
     ws.row_dimensions[1].height = 8
 
-    # Logo (top-left of sheet)
-    if logo_bytes:
-        try:
-            img = XLImage(io.BytesIO(logo_bytes))
-            img.width  = 150
-            img.height = 30
-            img.anchor = "B1"
-            ws.add_image(img)
-            ws.row_dimensions[1].height = 38
-        except Exception:
-            pass
+    # Logo (top-left of sheet) — embedded from _PROFITMART_LOGO_BYTES
+    try:
+        img = XLImage(io.BytesIO(_PROFITMART_LOGO_BYTES))
+        img.width  = 150
+        img.height = 30
+        img.anchor = "B1"
+        ws.add_image(img)
+        ws.row_dimensions[1].height = 38
+    except Exception:
+        pass
 
     # Title banner
     ws.row_dimensions[2].height = 30
@@ -1416,20 +1495,8 @@ async def download_tax_report(
             ],
         }
 
-    # Fetch PROFITMART logo (best-effort — silently ignored on failure)
-    logo_bytes: bytes | None = None
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as hc:
-            logo_resp = await hc.get(
-                "https://profitmart.in/wp-content/uploads/2023/03/Profitmart-Logo.png"
-            )
-            if logo_resp.status_code == 200:
-                logo_bytes = logo_resp.content
-    except Exception:
-        pass
 
-    wb = _tax_excel(client_name, holdings, realized_rows, prices,
-                    deriv_summary=deriv_summary, logo_bytes=logo_bytes)
+    wb = _tax_excel(client_name, holdings, realized_rows, prices, deriv_summary=deriv_summary)
 
     output = io.BytesIO()
     wb.save(output)
